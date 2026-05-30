@@ -1438,71 +1438,80 @@ function renderEventPage(t) {
 }
 
 function renderRunnersPage(runners) {
-  const rows = runners.map(renderRunnerRow).join('');
   return `
   <section class="page" id="page-runners">
     <h1 class="section-title collapsible"><span class="chev">▾</span> Runners</h1>
-    <p class="section-sub">Personas externas que compran tickets para KEMIN con tarjetas Slash asignadas. Comisión = % sobre profit neto.</p>
+    <p class="section-sub">Personas externas que compran tickets para KEMIN con tarjetas Slash asignadas. Cada runner es su propio mini-Stock con su comisión %.</p>
 
     <div class="collapse-target">
       <div class="toolbar">
         <input type="text" id="runner-search" placeholder="🔍 Buscar runner…" />
-        <select id="runner-filter-status">
-          <option value="">Status: Todos</option>
-          <option value="active">🟢 Activos</option>
-          <option value="paused">⏸ Pausados</option>
-          <option value="closed">⊘ Cerrados</option>
-        </select>
         <div class="spacer"></div>
         <button class="btn" onclick="openRunnerModal(null)">＋ Nuevo runner</button>
       </div>
 
-      <div class="table-wrap">
-        <table id="runners-table">
-          <thead>
-            <tr>
-              <th>Nombre</th>
-              <th>Tag</th>
-              <th class="num">%</th>
-              <th>Status</th>
-              <th class="num">Asignado</th>
-              <th class="num">Gastado</th>
-              <th class="num">Disponible</th>
-              <th class="num">Tickets</th>
-              <th class="num">Profit gen.</th>
-              <th class="num">Com. pendiente</th>
-              <th class="row-actions">⋯</th>
-            </tr>
-          </thead>
-          <tbody>${rows || `<tr><td colspan="11" style="text-align:center;color:var(--text-mute);padding:32px;">Sin runners aún. Click <strong>＋ Nuevo runner</strong>.</td></tr>`}</tbody>
-        </table>
-      </div>
+      ${runners.length === 0
+        ? `<div class="empty-state">Sin runners aún. Click <strong>＋ Nuevo runner</strong> para añadir el primero.</div>`
+        : runners.map(renderRunnerBlock).join('')
+      }
     </div>
   </section>`;
 }
 
-function renderRunnerRow(r) {
+function renderRunnerBlock(r) {
   const statusPill = {
     active: '<span class="pill pill-yes">🟢 Activo</span>',
     paused: '<span class="pill pill-pending">⏸ Pausado</span>',
     closed: '<span class="pill pill-mute">⊘ Cerrado</span>'
   }[r.status] || '';
-  const profitColor = r.profitGenerado >= 0 ? 'profit-pos' : 'profit-neg';
-  const pendColor = r.comisionPendiente > 0 ? 'profit-pos' : '';
+  const profitColor = r.profitGenerado >= 0 ? 'var(--green)' : 'var(--red)';
+  const pendColor = r.comisionPendiente > 0 ? 'var(--amber)' : 'var(--text-mute)';
+  const ticketRows = r.tickets.length ? r.tickets.map(renderStockRow).join('') : '';
+  const tag = escAttr(r.tag);
+
   return `
-  <tr data-tag="${escAttr(r.tag)}" data-status="${escAttr(r.status)}" data-name="${escAttr(r.name)}">
-    <td><strong>${esc(r.name)}</strong>${r.contact ? `<div style="font-size:11px;color:var(--text-mute);margin-top:2px;">${esc(r.contact)}</div>` : ''}</td>
-    <td class="acct">${esc(r.tag)}</td>
-    <td class="num">${(r.commission_pct * 100).toFixed(1)}%</td>
-    <td>${statusPill}</td>
-    <td class="num">${fmtUSD(r.asignado)}</td>
-    <td class="num">${fmtUSD(r.gastado)}</td>
-    <td class="num" style="color: var(--green); font-weight: 600;">${fmtUSD(r.disponible)}</td>
-    <td class="num">${r.ticketsVendidos}/${r.ticketsTotal}</td>
-    <td class="num ${profitColor}">${r.profitGenerado >= 0 ? '+' : ''}${fmtUSD(r.profitGenerado)}</td>
-    <td class="num ${pendColor}">${fmtUSD(r.comisionPendiente, 2)}</td>
-    <td><button class="row-menu" onclick="rowMenu(event, 'runner', '${escAttr(r.tag)}')">⋯</button></td>
-  </tr>`;
+  <div class="runner-block" data-runner="${tag}" data-status="${escAttr(r.status)}" data-name="${escAttr(r.name)}">
+    <div class="runner-block-header">
+      <div class="runner-title">
+        <h2>${esc(r.name)}</h2>
+        <span class="pill pill-violet">${(r.commission_pct * 100).toFixed(r.commission_pct * 100 % 1 ? 1 : 0)}% comisión</span>
+        ${statusPill}
+        ${r.contact ? `<span class="runner-contact">${esc(r.contact)}</span>` : ''}
+      </div>
+      <div class="runner-actions">
+        <button class="btn-ocr btn" onclick="openOcrModal('${tag}')">📸 Subir captura</button>
+        <button class="btn" onclick="openEditModal('stock', null, {origin:'${tag}'})">＋ Nuevo ticket</button>
+        <button class="row-menu" onclick="rowMenu(event, 'runner', '${tag}')" title="Acciones del runner">⋯</button>
+      </div>
+    </div>
+
+    <div class="runner-stats">
+      <div><span class="l">Asignado</span><span class="v">${fmtUSD(r.asignado)}</span></div>
+      <div><span class="l">Gastado</span><span class="v">${fmtUSD(r.gastado)}</span></div>
+      <div><span class="l">Disponible</span><span class="v" style="color:var(--green);">${fmtUSD(r.disponible)}</span></div>
+      <div class="rs-sep"></div>
+      <div><span class="l">Tickets</span><span class="v">${r.ticketsVendidos}/${r.ticketsTotal}</span></div>
+      <div><span class="l">Profit generado</span><span class="v" style="color:${profitColor};">${r.profitGenerado >= 0 ? '+' : ''}${fmtUSD(r.profitGenerado)}</span></div>
+      <div class="rs-sep"></div>
+      <div><span class="l">Com. devengada</span><span class="v">${fmtUSD(r.comisionDevengada, 2)}</span></div>
+      <div><span class="l">Com. pagada</span><span class="v">${fmtUSD(r.comisionPagada, 2)}</span></div>
+      <div><span class="l">Pendiente pago</span><span class="v" style="color:${pendColor};">${fmtUSD(r.comisionPendiente, 2)}</span></div>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Evento</th><th>Bought</th><th>Event</th><th>Retailer</th><th>Cuenta</th>
+            <th>Selling</th><th>Sección / Fila / Asiento</th>
+            <th class="num">Retail</th><th class="num">Listed</th><th class="num">Sold At</th>
+            <th class="num">Payout</th><th class="num">Profit</th><th>Estado</th><th class="row-actions">⋯</th>
+          </tr>
+        </thead>
+        <tbody>${ticketRows || `<tr><td colspan="14" style="text-align:center;color:var(--text-mute);padding:32px;">Sin tickets de ${esc(r.name)} aún. Click <strong>📸 Subir captura</strong> o <strong>＋ Nuevo ticket</strong>.</td></tr>`}</tbody>
+      </table>
+    </div>
+  </div>`;
 }
 
 function renderRunnerModal() {
@@ -1922,6 +1931,31 @@ tr:hover .row-menu { color: var(--text-dim); }
 .mockup-note { margin-top: 40px; padding: 16px 20px; background: rgba(16,185,129,0.05);
   border: 1px dashed rgba(16,185,129,0.3); border-radius: 10px; color: #6ee7b7; font-size: 12px; text-align: center; }
 .d-violet { background: var(--violet); }
+.empty-state { background: var(--surface); border: 1px dashed var(--border); border-radius: 14px;
+  padding: 40px; text-align: center; color: var(--text-mute); }
+
+.runner-block { background: var(--surface); border: 1px solid var(--border); border-radius: 16px;
+  margin-bottom: 22px; overflow: hidden; position: relative; }
+.runner-block::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+  background: linear-gradient(180deg, var(--violet), var(--cyan)); }
+.runner-block-header { display: flex; justify-content: space-between; align-items: center; gap: 14px;
+  padding: 18px 22px 14px; flex-wrap: wrap; border-bottom: 1px solid var(--border-soft); background: var(--bg-2); }
+.runner-title { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.runner-title h2 { font-family: 'Playfair Display', serif; font-size: 22px; font-weight: 700; font-style: italic; }
+.runner-contact { font-size: 11px; color: var(--text-mute); font-family: 'JetBrains Mono', monospace; }
+.runner-actions { display: flex; gap: 8px; align-items: center; }
+.runner-stats { display: flex; gap: 22px; flex-wrap: wrap; align-items: center; padding: 14px 22px;
+  background: linear-gradient(180deg, var(--bg-2), var(--surface)); border-bottom: 1px solid var(--border-soft); }
+.runner-stats > div { display: flex; flex-direction: column; gap: 2px; min-width: 90px; }
+.runner-stats .l { font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-mute); font-weight: 600; }
+.runner-stats .v { font-family: 'JetBrains Mono', monospace; font-size: 15px; font-weight: 600; color: var(--text); }
+.runner-stats .rs-sep { width: 1px; min-width: 1px !important; background: var(--border); align-self: stretch; margin: 0 4px; }
+.runner-block .table-wrap { border: none; border-radius: 0; }
+@media (max-width: 700px) {
+  .runner-stats { gap: 14px; }
+  .runner-stats .rs-sep { display: none; }
+  .runner-actions { flex-wrap: wrap; }
+}
 @media (max-width: 900px) {
   .chart-row, .chart-row.equal { grid-template-columns: 1fr; }
   .event-banner { flex-direction: column; gap: 16px; align-items: flex-start; }
@@ -2014,18 +2048,15 @@ function applyStockFilters() {
     const o = document.createElement('option'); o.value = e; o.textContent = e; sel.appendChild(o);
   });
 })();
-// Runners filtros
+// Runners filtros: busca por nombre/tag en bloques de runner
 function applyRunnerFilters() {
   const q = (document.getElementById('runner-search')?.value || '').toLowerCase();
-  const st = document.getElementById('runner-filter-status')?.value || '';
-  document.querySelectorAll('#runners-table tbody tr[data-tag]').forEach(tr => {
-    const okQ = !q || tr.textContent.toLowerCase().includes(q);
-    const okS = !st || tr.dataset.status === st;
-    tr.style.display = (okQ && okS) ? '' : 'none';
+  document.querySelectorAll('.runner-block').forEach(blk => {
+    const okQ = !q || (blk.dataset.name + ' ' + blk.dataset.runner).toLowerCase().includes(q);
+    blk.style.display = okQ ? '' : 'none';
   });
 }
-['runner-search','runner-filter-status'].forEach(id =>
-  document.getElementById(id)?.addEventListener('input', applyRunnerFilters));
+document.getElementById('runner-search')?.addEventListener('input', applyRunnerFilters);
 // Row menu
 window.rowMenu = function(e, kind, id) {
   e.stopPropagation();
@@ -2099,7 +2130,7 @@ window.duplicateRow = async function(kind, id) {
 // Modals
 window.openModal = id => document.getElementById(id)?.classList.add('open');
 window.closeModal = id => document.getElementById(id)?.classList.remove('open');
-window.openOcrModal = async function() {
+window.openOcrModal = async function(prefillRunnerTag) {
   document.getElementById('ocr-status').textContent = 'Sube una captura para empezar.';
   document.getElementById('ocr-form').style.display = 'none';
   document.getElementById('ocr-preview').textContent = 'click o arrastra una captura aquí';
@@ -2119,6 +2150,7 @@ window.openOcrModal = async function() {
         o.value = r.tag; o.textContent = '🏃 ' + r.name + ' (' + r.tag + ')';
         sel.appendChild(o);
       });
+      if (prefillRunnerTag) sel.value = prefillRunnerTag;
     } catch {}
   }
   openModal('ocr-modal');
@@ -2197,8 +2229,8 @@ window.confirmOcr = async function() {
   if (r.ok) { closeModal('ocr-modal'); softReload(); }
   else alert('Error: ' + (await r.text()));
 };
-// Edit modal
-window.openEditModal = async function(kind, id) {
+// Edit modal — admite prefill (ej. {origin: 'joey'} para crear ticket de un runner)
+window.openEditModal = async function(kind, id, prefill = {}) {
   const form = document.getElementById('edit-form');
   form.reset();
   form.elements['_kind'].value = kind;
@@ -2215,6 +2247,11 @@ window.openEditModal = async function(kind, id) {
         if (el) el.value = row[k] ?? '';
       }
     }
+  }
+  // Aplicar prefill (después de cargar row para que sobrescriba)
+  for (const k of Object.keys(prefill)) {
+    const el = form.elements[k];
+    if (el) el.value = prefill[k];
   }
   openModal('edit-modal');
 };
