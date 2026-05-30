@@ -209,7 +209,14 @@ const Q = {
     VALUES (@id, @uploaded_at, @filename, @filepath, @context, @input_tokens, @output_tokens,
             @cost_usd, @result_json, @created_stock_ids, @user, @error)
   `),
-  updateOcrLogStockIds: db.prepare(`UPDATE ocr_log SET created_stock_ids = ? WHERE id = ?`)
+  updateOcrLogStockIds: db.prepare(`UPDATE ocr_log SET created_stock_ids = ? WHERE id = ?`),
+
+  insertCapital: db.prepare(`
+    INSERT INTO capital_movements (id, type, amount, fecha, source, notas, created_at, updated_at)
+    VALUES (@id, @type, @amount, @fecha, @source, @notas, @created_at, @updated_at)
+  `),
+  allCapital: db.prepare(`SELECT * FROM capital_movements ORDER BY fecha DESC, created_at DESC`),
+  deleteCapital: db.prepare(`DELETE FROM capital_movements WHERE id = ?`)
 };
 
 // -----------------------------------------------------------------------------
@@ -217,6 +224,8 @@ const Q = {
 // -----------------------------------------------------------------------------
 function calcTreasury() {
   const all = Q.allStock.all().map(applyStatusAuto);
+  const expenses = Q.allExpenses.all();
+  const capMovs = Q.allCapital.all();
   const sumRetail = rows => rows.reduce((s, r) => s + (r.price_retail || 0), 0);
 
   const buckets = {
@@ -230,11 +239,26 @@ function calcTreasury() {
   const capSinListar = sumRetail(buckets.sinListar);
   const capListado   = sumRetail(buckets.listado);
   const capPending   = buckets.pendingPayout.reduce((s, r) => s + (r.sold_at || r.listed_at || r.price_retail || 0), 0);
-  const cashReceived = buckets.cobrados.reduce((s, r) => s + (r.payout_amount || 0), 0)
-                     - buckets.cobrados.reduce((s, r) => s + (r.price_retail || 0), 0);
-  const lossesNet    = buckets.perdidas.reduce((s, r) => s + ((r.payout_amount || 0) - (r.price_retail || 0)), 0);
 
-  const totalActivo = capSinListar + capListado + capPending + Math.max(0, cashReceived);
+  // Cash flow real en el banco (Slash)
+  const deposits     = capMovs.filter(m => m.type === 'deposit').reduce((s, m) => s + m.amount, 0);
+  const withdrawals  = capMovs.filter(m => m.type === 'withdrawal').reduce((s, m) => s + m.amount, 0);
+  const payoutsCobrados = buckets.cobrados.reduce((s, r) => s + (r.payout_amount || 0), 0)
+                        + buckets.perdidas.reduce((s, r) => s + (r.payout_amount || 0), 0);
+  const compraTickets   = all.reduce((s, r) => s + (r.price_retail || 0), 0); // todo lo invertido en tickets
+  const gastosPagados   = expenses.reduce((s, e) => s + (e.total_pagado || 0), 0);
+  const totalInvertido  = compraTickets;
+  const cashback        = totalInvertido * SLASH_CASHBACK_RATE;
+
+  // Cash actualmente en el banco
+  const cashEnBanco = deposits - withdrawals + payoutsCobrados + cashback - compraTickets - gastosPagados;
+
+  // Capital total controlado = cash en banco + valor activo en tickets
+  const capitalTotal = cashEnBanco + capSinListar + capListado + capPending;
+
+  // Histórico: profit realizado y pérdidas
+  const profitRealizado = buckets.cobrados.reduce((s, r) => s + ((r.payout_amount || 0) - (r.price_retail || 0)), 0);
+  const lossesNet       = buckets.perdidas.reduce((s, r) => s + ((r.payout_amount || 0) - (r.price_retail || 0)), 0);
 
   // < 7 días sin vender
   const lt7 = all.filter(r => {
@@ -244,19 +268,18 @@ function calcTreasury() {
   });
   const lt7Cap = sumRetail(lt7);
 
-  // Cashback Slash 2% sobre total invertido (incluye lost/cobrado)
-  const totalInvertido = all.reduce((s, r) => s + (r.price_retail || 0), 0);
-  const cashback = totalInvertido * SLASH_CASHBACK_RATE;
-
   return {
-    totalActivo,
+    capitalTotal,
     cashback,
     totalInvertido,
+    cashEnBanco,
+    deposits, withdrawals,
     buckets: {
+      cashEnBanco:  { amount: cashEnBanco, count: capMovs.length, label: 'Cash en Slash' },
       sinListar:    { amount: capSinListar, count: buckets.sinListar.length },
       listado:      { amount: capListado,   count: buckets.listado.length },
       pendingPayout:{ amount: capPending,   count: buckets.pendingPayout.length },
-      cashReceived: { amount: Math.max(0, cashReceived), count: buckets.cobrados.length },
+      profitRealizado: { amount: profitRealizado, count: buckets.cobrados.length },
       perdidas:     { amount: lossesNet,    count: buckets.perdidas.length }
     },
     lt7: { amount: lt7Cap, count: lt7.length }
@@ -653,6 +676,37 @@ app.patch('/api/events/:nombre', (req, res) => {
 });
 
 // =============================================================================
+// API — CAPITAL MOVEMENTS
+// =============================================================================
+app.get('/api/capital', (req, res) => res.json(Q.allCapital.all()));
+
+app.post('/api/capital', (req, res) => {
+  try {
+    const type = (req.body.type === 'withdrawal') ? 'withdrawal' : 'deposit';
+    const amount = numOrNull(req.body.amount);
+    if (!amount || amount <= 0) throw new Error('amount > 0 requerido');
+    const now = nowISO();
+    const row = {
+      id: randomUUID(),
+      type,
+      amount,
+      fecha: req.body.fecha || today(),
+      source: req.body.source || 'Slash transfer',
+      notas: req.body.notas || null,
+      created_at: now,
+      updated_at: now
+    };
+    Q.insertCapital.run(row);
+    res.json({ ok: true, id: row.id });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+app.delete('/api/capital/:id', (req, res) => {
+  const r = Q.deleteCapital.run(req.params.id);
+  res.json({ ok: r.changes > 0 });
+});
+
+// =============================================================================
 // API — OCR
 // =============================================================================
 app.post('/api/ocr', upload.single('image'), async (req, res) => {
@@ -827,6 +881,7 @@ function renderPage(ctx) {
 
 ${renderOcrModal()}
 ${renderEditModal(constants)}
+${renderCapitalModal()}
 
 <script>
 window.KEMIN = ${jsonScript({ retailers: constants.RETAILERS, platforms: constants.SELLING_PLATFORMS, ticketTypes: constants.TICKET_TYPES, expenseCats: constants.EXPENSE_CATEGORIES, statuses: constants.STATUSES })};
@@ -836,27 +891,31 @@ ${CLIENT_JS}
 }
 
 function renderTesoreriaPage(t) {
-  const total = t.totalActivo;
+  const total = t.capitalTotal;
   const buckets = t.buckets;
-  const pct = v => total > 0 ? Math.round((v / total) * 100) : 0;
+  const pct = v => total > 0 ? Math.round((Math.max(0, v) / total) * 100) : 0;
   return `
   <section class="page active" id="page-tesoreria">
     <h1 class="section-title collapsible"><span class="chev">▾</span> ¿Dónde está el dinero ahora mismo?</h1>
-    <p class="section-sub">El capital está esparcido en varios buckets. Foto en vivo.</p>
+    <p class="section-sub">Cash en banco + lo que está invertido en tickets. Foto en vivo.</p>
 
     <div class="collapse-target">
       <div class="treasury-hero">
         <div class="treasury-total">
-          <div class="treasury-label">Capital total activo</div>
+          <div class="treasury-label">Capital total controlado</div>
           <div class="treasury-value">${fmtUSD(total)}</div>
-          <div class="treasury-delta">snapshot ahora</div>
+          <div class="treasury-delta">${t.deposits > 0 ? `${fmtUSD(t.deposits)} aportado · ${fmtUSD(t.cashback)} cashback` : 'snapshot ahora'}</div>
         </div>
         <div class="treasury-bars">
-          ${bar('d-cyan', 'Stock sin listar', buckets.sinListar.amount, pct(buckets.sinListar.amount), '--cyan')}
-          ${bar('d-blue', 'Stock listado para vender', buckets.listado.amount, pct(buckets.listado.amount), '--blue')}
-          ${bar('d-amber', 'Vendido sin payout', buckets.pendingPayout.amount, pct(buckets.pendingPayout.amount), '--amber')}
-          ${bar('d-green', 'Cash recibido (líquido)', buckets.cashReceived.amount, pct(buckets.cashReceived.amount), '--green')}
+          ${bar('d-green', '💵 Cash en Slash (disponible)', buckets.cashEnBanco.amount, pct(buckets.cashEnBanco.amount), '--green')}
+          ${bar('d-cyan', '🛒 Stock sin listar', buckets.sinListar.amount, pct(buckets.sinListar.amount), '--cyan')}
+          ${bar('d-blue', '🏷 Stock listado para vender', buckets.listado.amount, pct(buckets.listado.amount), '--blue')}
+          ${bar('d-amber', '⏳ Vendido sin payout', buckets.pendingPayout.amount, pct(buckets.pendingPayout.amount), '--amber')}
         </div>
+      </div>
+      <div style="display: flex; gap: 10px; justify-content: flex-end; margin-bottom: 26px;">
+        <button class="btn-ghost btn" onclick="openCapitalModal('withdrawal')">⤓ Retiro</button>
+        <button class="btn" onclick="openCapitalModal('deposit')">＋ Capital injection</button>
       </div>
     </div>
 
@@ -865,13 +924,14 @@ function renderTesoreriaPage(t) {
 
     <div class="collapse-target">
       <div class="kpi-grid stagger">
+        ${kpiCard('💵 Cash en Slash', fmtUSD(buckets.cashEnBanco.amount), `disponible para comprar`, 'accent-green', null, 'Depósitos − retiros + payouts + cashback − compras − gastos')}
         ${kpiCard('🛒 Stock sin listar', fmtUSD(buckets.sinListar.amount), `${buckets.sinListar.count} tickets · esperando publicación`, 'accent-cyan clickable', 'comprado')}
         ${kpiCard('🏷 Stock listado', fmtUSD(buckets.listado.amount), `${buckets.listado.count} tickets · en marketplaces`, 'accent-blue clickable', 'listed')}
         ${kpiCard('⏳ Vendido sin payout', fmtUSD(buckets.pendingPayout.amount), `${buckets.pendingPayout.count} tickets · pendiente cobro`, 'accent-amber clickable', 'sold')}
-        ${kpiCard('💵 Cash recibido', fmtUSD(buckets.cashReceived.amount), `${buckets.cashReceived.count} cerrados con beneficio`, 'accent-green clickable', 'cobrado')}
+        ${kpiCard('✅ Profit realizado', (buckets.profitRealizado.amount >= 0 ? '+' : '') + fmtUSD(buckets.profitRealizado.amount), `${buckets.profitRealizado.count} cerrados con beneficio`, 'accent-green clickable', 'cobrado')}
         ${kpiCard('📉 Pérdidas realizadas', fmtUSD(buckets.perdidas.amount), `${buckets.perdidas.count} tickets cerrados a pérdida`, 'accent-red clickable', 'lost')}
         ${kpiCard('⏰ < 7 días, sin vender', fmtUSD(t.lt7.amount), `${t.lt7.count} tickets · urge bajar precio`, 'clickable', null)}
-        ${kpiCard('💳 Cashback Slash (2%)', fmtUSD(t.cashback), `${fmtUSD(t.totalInvertido)} invertido × 2%`, 'accent-green', null, 'Slash devuelve 2% por cada compra')}
+        ${kpiCard('💳 Cashback Slash (2%)', fmtUSD(t.cashback), `${fmtUSD(t.totalInvertido)} invertido × 2%`, 'accent-green', null, 'Slash devuelve 2% por cada compra. Sumado al cash en banco.')}
       </div>
     </div>
   </section>`;
@@ -1243,6 +1303,33 @@ function renderEventPage(t) {
       </div>
     </div>
   </section>`;
+}
+
+function renderCapitalModal() {
+  return `
+<div class="modal-overlay" id="capital-modal">
+  <div class="modal" style="max-width: 520px;">
+    <div class="modal-header">
+      <h2 id="capital-modal-title">💵 Movimiento de capital</h2>
+      <button class="close" onclick="closeModal('capital-modal')">✕</button>
+    </div>
+    <div class="modal-body" style="grid-template-columns: 1fr; padding: 24px 28px;">
+      <form id="capital-form" onsubmit="return saveCapital(event)">
+        <input type="hidden" name="type" value="deposit" />
+        <div class="ocr-field"><label>Cantidad (USD) *</label><input type="number" step="0.01" name="amount" required placeholder="25000" /></div>
+        <div class="ocr-field-row">
+          <div class="ocr-field"><label>Fecha</label><input type="date" name="fecha" /></div>
+          <div class="ocr-field" style="grid-column: span 2;"><label>Origen</label><input type="text" name="source" placeholder="Slash transfer" value="Slash transfer" /></div>
+        </div>
+        <div class="ocr-field"><label>Notas (opcional)</label><input type="text" name="notas" placeholder="ej. capital inicial Fer+Kevin 50/50" /></div>
+        <div style="display: flex; gap: 10px; justify-content: flex-end; margin-top: 22px;">
+          <button type="button" class="btn btn-ghost" onclick="closeModal('capital-modal')">Cancelar</button>
+          <button type="submit" class="btn">✓ Guardar</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>`;
 }
 
 function renderOcrModal() {
@@ -1846,6 +1933,26 @@ window.saveEdit = async function(ev) {
   const method = id ? 'PATCH' : 'POST';
   const r = await fetch(url, { method, headers: {'Content-Type':'application/json'}, body: JSON.stringify(obj) });
   if (r.ok) { closeModal('edit-modal'); location.reload(); }
+  else alert('Error: ' + (await r.text()));
+  return false;
+};
+// Capital modal
+window.openCapitalModal = function(type) {
+  const form = document.getElementById('capital-form');
+  form.reset();
+  form.elements['type'].value = type;
+  form.elements['fecha'].value = new Date().toISOString().slice(0,10);
+  document.getElementById('capital-modal-title').textContent =
+    type === 'deposit' ? '💵 Inyección de capital (deposit)' : '⤓ Retiro de capital (withdrawal)';
+  openModal('capital-modal');
+};
+window.saveCapital = async function(ev) {
+  ev.preventDefault();
+  const form = document.getElementById('capital-form');
+  const fd = new FormData(form);
+  const body = Object.fromEntries(fd);
+  const r = await fetch('/api/capital', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  if (r.ok) { closeModal('capital-modal'); location.reload(); }
   else alert('Error: ' + (await r.text()));
   return false;
 };
