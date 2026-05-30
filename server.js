@@ -124,8 +124,10 @@ function jsonScript(obj) { return JSON.stringify(obj).replace(/</g, '\\u003c'); 
 // Status auto-compute (idempotent — se llama en GET y antes de INSERT/UPDATE)
 // -----------------------------------------------------------------------------
 function computeStatus(row) {
-  // Si manualmente marcado lost o cobrado, respetar
   if (row.status === 'lost') return 'lost';
+  // Auto-lost: cobrado pero por debajo del retail (operación neta negativa)
+  if (row.payout_amount != null && row.payout_date && row.price_retail != null
+      && row.payout_amount < row.price_retail) return 'lost';
   if (row.payout_amount != null && row.payout_date) return 'cobrado';
   if (row.sold_at != null) return 'sold';
   if (row.listed_at != null) return 'listed';
