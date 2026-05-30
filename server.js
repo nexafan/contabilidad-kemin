@@ -1519,7 +1519,7 @@ function renderRunnerModal() {
         <div class="ocr-field"><label>Nombre *</label><input type="text" name="name" required placeholder="Joey" /></div>
         <div class="ocr-field-row">
           <div class="ocr-field"><label>Tag (slug) *</label><input type="text" name="tag" required placeholder="joey" pattern="[a-z0-9_-]+" /></div>
-          <div class="ocr-field"><label>Comisión % (0.15 = 15%) *</label><input type="number" step="0.01" min="0" max="1" name="commission_pct" required placeholder="0.15" /></div>
+          <div class="ocr-field"><label>Comisión % *</label><input type="number" step="0.5" min="0" max="100" name="commission_pct_display" required placeholder="15" /></div>
           <div class="ocr-field"><label>Status</label><select name="status"><option value="active">🟢 Activo</option><option value="paused">⏸ Pausado</option><option value="closed">⊘ Cerrado</option></select></div>
         </div>
         <div class="ocr-field"><label>Contacto (opcional)</label><input type="text" name="contact" placeholder="@joeytickets · joey@telegram" /></div>
@@ -1600,7 +1600,11 @@ function renderOcrModal() {
             ${ocrField('N tickets', 'n_tickets', 'number')}
             ${ocrField('Cuenta del retailer', 'cuenta', 'text')}
           </div>
-          ${ocrSelect('Selling platform', 'selling_platform', ['', ...SELLING_PLATFORMS])}
+          <div class="ocr-field-row">
+            <div class="ocr-field"><label>Origen <span class="conf" style="background:rgba(139,92,246,0.15);color:var(--violet);">runner</span></label><select name="origin" id="ocr-origin"><option value="manual">Manual (compra propia)</option></select></div>
+            ${ocrSelect('Selling platform', 'selling_platform', ['', ...SELLING_PLATFORMS])}
+            <div></div>
+          </div>
           ${ocrField('Notas', 'notas', 'text')}
         </div>
       </div>
@@ -2095,7 +2099,7 @@ window.duplicateRow = async function(kind, id) {
 // Modals
 window.openModal = id => document.getElementById(id)?.classList.add('open');
 window.closeModal = id => document.getElementById(id)?.classList.remove('open');
-window.openOcrModal = () => {
+window.openOcrModal = async function() {
   document.getElementById('ocr-status').textContent = 'Sube una captura para empezar.';
   document.getElementById('ocr-form').style.display = 'none';
   document.getElementById('ocr-preview').textContent = 'click o arrastra una captura aquí';
@@ -2104,6 +2108,19 @@ window.openOcrModal = () => {
   document.getElementById('ocr-footer-info').textContent = '—';
   document.getElementById('ocr-loading').style.display = 'none';
   window.__ocr = null;
+  // Poblar dropdown de Origen con runners activos
+  const sel = document.getElementById('ocr-origin');
+  if (sel) {
+    sel.innerHTML = '<option value="manual">Manual (compra propia)</option>';
+    try {
+      const runners = await (await fetch('/api/runners')).json();
+      runners.filter(r => r.status === 'active').forEach(r => {
+        const o = document.createElement('option');
+        o.value = r.tag; o.textContent = '🏃 ' + r.name + ' (' + r.tag + ')';
+        sel.appendChild(o);
+      });
+    } catch {}
+  }
   openModal('ocr-modal');
 };
 // OCR flow
@@ -2272,7 +2289,7 @@ window.openRunnerModal = async function(tag) {
       form.elements['name'].value = r.name;
       form.elements['tag'].value = r.tag;
       form.elements['tag'].readOnly = true;
-      form.elements['commission_pct'].value = r.commission_pct;
+      form.elements['commission_pct_display'].value = (r.commission_pct * 100).toFixed(1).replace(/\.0$/, '');
       form.elements['status'].value = r.status;
       form.elements['contact'].value = r.contact || '';
       form.elements['notas'].value = r.notas || '';
@@ -2294,6 +2311,11 @@ window.saveRunner = async function(ev) {
   const fd = new FormData(form);
   const body = Object.fromEntries(fd);
   const originalTag = body._originalTag; delete body._originalTag;
+  // Convertir % humano (ej. 40) → decimal (0.40) para el backend
+  const pctHuman = parseFloat(body.commission_pct_display);
+  if (isNaN(pctHuman) || pctHuman < 0 || pctHuman > 100) { alert('Comisión % debe ser entre 0 y 100'); return false; }
+  body.commission_pct = pctHuman / 100;
+  delete body.commission_pct_display;
   const url = originalTag ? '/api/runners/' + originalTag : '/api/runners';
   const method = originalTag ? 'PATCH' : 'POST';
   const r = await fetch(url, { method, headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
