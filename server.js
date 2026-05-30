@@ -994,9 +994,9 @@ function renderPage(ctx) {
   </header>
 
   <nav class="tabs stagger">
-    <div class="tab tab-treasury active" data-tab="tesoreria">💰 Tesorería</div>
+    <div class="tab tab-treasury active" data-tab="tesoreria">Tesorería</div>
     <div class="tab" data-tab="stock">Stock <span class="tab-badge">${stockActive.length}</span></div>
-    <div class="tab" data-tab="runners">🏃 Runners <span class="tab-badge">${runners.filter(r => r.status === 'active').length}</span></div>
+    <div class="tab" data-tab="runners">Runners <span class="tab-badge">${runners.filter(r => r.status === 'active').length}</span></div>
     <div class="tab" data-tab="expenses">Expenses</div>
     <div class="tab" data-tab="dashboard">Dashboard</div>
     <div class="tab" data-tab="finalizados">Finalizados <span class="tab-badge">${finalizados.length}</span></div>
@@ -1438,83 +1438,71 @@ function renderEventPage(t) {
 }
 
 function renderRunnersPage(runners) {
-  const activos = runners.filter(r => r.status === 'active');
-  const otros   = runners.filter(r => r.status !== 'active');
+  const rows = runners.map(renderRunnerRow).join('');
   return `
   <section class="page" id="page-runners">
-    <h1 class="section-title collapsible"><span class="chev">▾</span> 🏃 Runners</h1>
+    <h1 class="section-title collapsible"><span class="chev">▾</span> Runners</h1>
     <p class="section-sub">Personas externas que compran tickets para KEMIN con tarjetas Slash asignadas. Comisión = % sobre profit neto.</p>
 
     <div class="collapse-target">
       <div class="toolbar">
+        <input type="text" id="runner-search" placeholder="🔍 Buscar runner…" />
+        <select id="runner-filter-status">
+          <option value="">Status: Todos</option>
+          <option value="active">🟢 Activos</option>
+          <option value="paused">⏸ Pausados</option>
+          <option value="closed">⊘ Cerrados</option>
+        </select>
         <div class="spacer"></div>
         <button class="btn" onclick="openRunnerModal(null)">＋ Nuevo runner</button>
       </div>
 
-      ${activos.length === 0 && otros.length === 0
-        ? `<div style="background: var(--surface); border: 1px dashed var(--border); border-radius: 14px; padding: 40px; text-align: center; color: var(--text-mute);">
-            Aún no hay runners. Click <strong>＋ Nuevo runner</strong> para añadir el primero.
-          </div>`
-        : activos.map(renderRunnerCard).join('') + (otros.length ? `<h2 style="font-family:'Playfair Display',serif;font-size:18px;margin:32px 0 14px;color:var(--text-dim);">Pausados / cerrados</h2>` + otros.map(renderRunnerCard).join('') : '')
-      }
+      <div class="table-wrap">
+        <table id="runners-table">
+          <thead>
+            <tr>
+              <th>Nombre</th>
+              <th>Tag</th>
+              <th class="num">%</th>
+              <th>Status</th>
+              <th class="num">Asignado</th>
+              <th class="num">Gastado</th>
+              <th class="num">Disponible</th>
+              <th class="num">Tickets</th>
+              <th class="num">Profit gen.</th>
+              <th class="num">Com. pendiente</th>
+              <th class="row-actions">⋯</th>
+            </tr>
+          </thead>
+          <tbody>${rows || `<tr><td colspan="11" style="text-align:center;color:var(--text-mute);padding:32px;">Sin runners aún. Click <strong>＋ Nuevo runner</strong>.</td></tr>`}</tbody>
+        </table>
+      </div>
     </div>
   </section>`;
 }
 
-function renderRunnerCard(r) {
-  const statusBadge = {
+function renderRunnerRow(r) {
+  const statusPill = {
     active: '<span class="pill pill-yes">🟢 Activo</span>',
     paused: '<span class="pill pill-pending">⏸ Pausado</span>',
     closed: '<span class="pill pill-mute">⊘ Cerrado</span>'
   }[r.status] || '';
-  const ticketsClosed = r.tickets.filter(t => t.status === 'cobrado' || t.status === 'lost').length;
-  const rows = r.tickets.length
-    ? r.tickets.slice(0, 25).map(t => {
-        const profit = (t.payout_amount || 0) - (t.price_retail || 0);
-        const closed = t.status === 'cobrado' || t.status === 'lost';
-        return `<tr><td><strong>${esc(t.evento)}</strong></td><td>${fmtDateShort(t.bought_date)}</td><td>${retailerTag(t.retailer)}</td><td class="num">${fmtUSD(t.price_retail)}</td><td class="num">${fmtUSD(t.payout_amount, 2)}</td><td class="num ${profit > 0 ? 'profit-pos' : profit < 0 ? 'profit-neg' : ''}">${closed ? (profit >= 0 ? '+' : '') + fmtUSD(profit) : '—'}</td><td>${statusToPill(t.status)}</td></tr>`;
-      }).join('')
-    : `<tr><td colspan="7" style="text-align:center;color:var(--text-mute);padding:24px;">Sin tickets aún. Cuando registres tickets en Stock con <code style="background:var(--surface-3);padding:2px 6px;border-radius:4px;">origin = ${esc(r.tag)}</code> aparecerán aquí.</td></tr>`;
-  const moreRows = r.tickets.length > 25 ? `<tr><td colspan="7" style="text-align:center;color:var(--text-mute);padding:10px;">+${r.tickets.length - 25} más · <a href="#stock" onclick="document.querySelector('.tab[data-tab=stock]').click()" style="color:var(--cyan)">ver en Stock</a></td></tr>` : '';
-
+  const profitColor = r.profitGenerado >= 0 ? 'profit-pos' : 'profit-neg';
+  const pendColor = r.comisionPendiente > 0 ? 'profit-pos' : '';
   return `
-  <div class="runner-card">
-    <div class="runner-header">
-      <div>
-        <h2><span class="runner-name">${esc(r.name)}</span> <span class="runner-tag">${esc(r.tag)}</span> ${statusBadge}</h2>
-        <p class="runner-meta">${(r.commission_pct * 100).toFixed(1)}% comisión sobre profit ${r.contact ? '· ' + esc(r.contact) : ''}</p>
-      </div>
-      <div style="display: flex; gap: 8px;">
-        <button class="btn btn-ghost" onclick="openCapModal('allocation', '${escAttr(r.tag)}', '${escAttr(r.name)}')">＋ Asignar capital</button>
-        <button class="btn btn-ghost" onclick="openCapModal('return', '${escAttr(r.tag)}', '${escAttr(r.name)}')">⤓ Devolución</button>
-        <button class="btn btn-ghost" onclick="openCapModal('commission', '${escAttr(r.tag)}', '${escAttr(r.name)}')" ${r.comisionPendiente <= 0 ? 'disabled' : ''}>💸 Pagar comisión</button>
-        <button class="row-menu" onclick="rowMenu(event, 'runner', '${escAttr(r.tag)}')">⋯</button>
-      </div>
-    </div>
-
-    <div class="runner-kpis">
-      <div class="rk"><div class="l">💼 Asignado</div><div class="v">${fmtUSD(r.asignado)}</div></div>
-      <div class="rk"><div class="l">💸 Gastado</div><div class="v">${fmtUSD(r.gastado)}</div></div>
-      <div class="rk"><div class="l">💵 Disponible</div><div class="v" style="color: var(--green);">${fmtUSD(r.disponible)}</div></div>
-      <div class="rk-sep"></div>
-      <div class="rk"><div class="l">🎟 Tickets</div><div class="v">${r.ticketsVendidos}/${r.ticketsTotal}</div></div>
-      <div class="rk"><div class="l">✅ Profit generado</div><div class="v" style="color: ${r.profitGenerado >= 0 ? 'var(--green)' : 'var(--red)'};">${r.profitGenerado >= 0 ? '+' : ''}${fmtUSD(r.profitGenerado)}</div></div>
-      <div class="rk-sep"></div>
-      <div class="rk"><div class="l">💰 Devengada</div><div class="v">${fmtUSD(r.comisionDevengada, 2)}</div></div>
-      <div class="rk"><div class="l">✓ Pagada</div><div class="v">${fmtUSD(r.comisionPagada, 2)}</div></div>
-      <div class="rk"><div class="l">⏳ Pendiente</div><div class="v" style="color: ${r.comisionPendiente > 0 ? 'var(--amber)' : 'var(--text-dim)'};">${fmtUSD(r.comisionPendiente, 2)}</div></div>
-    </div>
-
-    <details class="runner-tickets">
-      <summary>${r.tickets.length} ticket${r.tickets.length === 1 ? '' : 's'} de ${esc(r.name)}</summary>
-      <div class="table-wrap" style="margin-top: 10px;">
-        <table>
-          <thead><tr><th>Evento</th><th>Bought</th><th>Retailer</th><th class="num">Retail</th><th class="num">Payout</th><th class="num">Profit</th><th>Estado</th></tr></thead>
-          <tbody>${rows}${moreRows}</tbody>
-        </table>
-      </div>
-    </details>
-  </div>`;
+  <tr data-tag="${escAttr(r.tag)}" data-status="${escAttr(r.status)}" data-name="${escAttr(r.name)}">
+    <td><strong>${esc(r.name)}</strong>${r.contact ? `<div style="font-size:11px;color:var(--text-mute);margin-top:2px;">${esc(r.contact)}</div>` : ''}</td>
+    <td class="acct">${esc(r.tag)}</td>
+    <td class="num">${(r.commission_pct * 100).toFixed(1)}%</td>
+    <td>${statusPill}</td>
+    <td class="num">${fmtUSD(r.asignado)}</td>
+    <td class="num">${fmtUSD(r.gastado)}</td>
+    <td class="num" style="color: var(--green); font-weight: 600;">${fmtUSD(r.disponible)}</td>
+    <td class="num">${r.ticketsVendidos}/${r.ticketsTotal}</td>
+    <td class="num ${profitColor}">${r.profitGenerado >= 0 ? '+' : ''}${fmtUSD(r.profitGenerado)}</td>
+    <td class="num ${pendColor}">${fmtUSD(r.comisionPendiente, 2)}</td>
+    <td><button class="row-menu" onclick="rowMenu(event, 'runner', '${escAttr(r.tag)}')">⋯</button></td>
+  </tr>`;
 }
 
 function renderRunnerModal() {
@@ -1929,39 +1917,7 @@ tr:hover .row-menu { color: var(--text-dim); }
 .row-menu-dropdown button.danger:hover { background: rgba(239,68,68,0.1); }
 .mockup-note { margin-top: 40px; padding: 16px 20px; background: rgba(16,185,129,0.05);
   border: 1px dashed rgba(16,185,129,0.3); border-radius: 10px; color: #6ee7b7; font-size: 12px; text-align: center; }
-.runner-card { background: linear-gradient(135deg, var(--surface) 0%, var(--surface-2) 100%);
-  border: 1px solid var(--border); border-radius: 16px; padding: 22px 26px; margin-bottom: 16px;
-  position: relative; overflow: hidden; }
-.runner-card::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
-  background: linear-gradient(180deg, var(--violet), var(--cyan)); }
-.runner-header { display: flex; justify-content: space-between; align-items: flex-start;
-  margin-bottom: 18px; flex-wrap: wrap; gap: 12px; }
-.runner-header h2 { font-family: 'Playfair Display', serif; font-size: 22px; font-weight: 700;
-  display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.runner-tag { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--cyan-soft);
-  background: rgba(34,211,238,0.1); border: 1px solid rgba(34,211,238,0.2); padding: 2px 8px;
-  border-radius: 6px; font-weight: 500; letter-spacing: 0.5px; }
-.runner-name { font-style: italic; }
-.runner-meta { font-size: 12px; color: var(--text-mute); margin-top: 4px; }
-.runner-kpis { display: flex; gap: 18px; flex-wrap: wrap; align-items: center;
-  padding: 16px; background: var(--bg-2); border-radius: 12px; border: 1px solid var(--border-soft); }
-.runner-kpis .rk { flex: 1 1 auto; min-width: 100px; }
-.runner-kpis .rk .l { font-size: 10px; text-transform: uppercase; letter-spacing: 1px;
-  color: var(--text-mute); margin-bottom: 4px; font-weight: 600; }
-.runner-kpis .rk .v { font-family: 'JetBrains Mono', monospace; font-size: 16px; font-weight: 600; color: var(--text); }
-.runner-kpis .rk-sep { width: 1px; background: var(--border); align-self: stretch; }
-.runner-tickets { margin-top: 16px; }
-.runner-tickets summary { cursor: pointer; font-size: 12px; color: var(--text-dim); padding: 8px 0;
-  user-select: none; list-style: none; display: flex; align-items: center; gap: 6px; }
-.runner-tickets summary::before { content: '▸'; transition: transform 0.2s; color: var(--cyan); }
-.runner-tickets[open] summary::before { transform: rotate(90deg); }
-.runner-tickets summary:hover { color: var(--text); }
 .d-violet { background: var(--violet); }
-.kpi.accent-violet { }
-@media (max-width: 700px) {
-  .runner-kpis { gap: 12px; }
-  .runner-kpis .rk-sep { display: none; }
-}
 @media (max-width: 900px) {
   .chart-row, .chart-row.equal { grid-template-columns: 1fr; }
   .event-banner { flex-direction: column; gap: 16px; align-items: flex-start; }
@@ -2054,6 +2010,18 @@ function applyStockFilters() {
     const o = document.createElement('option'); o.value = e; o.textContent = e; sel.appendChild(o);
   });
 })();
+// Runners filtros
+function applyRunnerFilters() {
+  const q = (document.getElementById('runner-search')?.value || '').toLowerCase();
+  const st = document.getElementById('runner-filter-status')?.value || '';
+  document.querySelectorAll('#runners-table tbody tr[data-tag]').forEach(tr => {
+    const okQ = !q || tr.textContent.toLowerCase().includes(q);
+    const okS = !st || tr.dataset.status === st;
+    tr.style.display = (okQ && okS) ? '' : 'none';
+  });
+}
+['runner-search','runner-filter-status'].forEach(id =>
+  document.getElementById(id)?.addEventListener('input', applyRunnerFilters));
 // Row menu
 window.rowMenu = function(e, kind, id) {
   e.stopPropagation();
@@ -2069,6 +2037,9 @@ window.rowMenu = function(e, kind, id) {
       { label: '✅ Marcar Cobrado', fn: () => quickPatch(kind, id, { status: 'cobrado', payout_amount: prompt('Payout amount (USD)?'), payout_date: new Date().toISOString().slice(0,10) }) }
     ] : []),
     ...(kind === 'runner' ? [
+      { label: '＋ Asignar capital', fn: () => openCapModal('allocation', id, id) },
+      { label: '⤓ Devolución', fn: () => openCapModal('return', id, id) },
+      { label: '💸 Pagar comisión', fn: () => openCapModal('commission', id, id) },
       { label: '⏸ Pausar', fn: () => quickPatchRunner(id, { status: 'paused' }) },
       { label: '🟢 Activar', fn: () => quickPatchRunner(id, { status: 'active' }) },
       { label: '⊘ Cerrar', fn: () => quickPatchRunner(id, { status: 'closed' }) }
