@@ -125,3 +125,23 @@ CREATE TABLE IF NOT EXISTS capital_movements (
 );
 
 CREATE INDEX IF NOT EXISTS idx_cap_fecha ON capital_movements(fecha);
+
+-- -----------------------------------------------------------------------------
+-- RUNNERS: personas externas que compran tickets para KEMIN con capital
+-- asignado (allocations en capital_movements). Cobran % sobre profit neto
+-- de los tickets que ellos compraron (origin = runner.tag).
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS runners (
+  id              TEXT PRIMARY KEY,
+  name            TEXT NOT NULL UNIQUE,            -- "Joey", "Mike"
+  tag             TEXT NOT NULL UNIQUE,            -- "joey" — coincide con stock.origin
+  commission_pct  REAL NOT NULL DEFAULT 0.15,      -- 0.15 = 15%
+  contact         TEXT,
+  status          TEXT NOT NULL DEFAULT 'active',  -- active | paused | closed
+  notas           TEXT,
+  created_at      TEXT NOT NULL,
+  updated_at      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_runners_tag    ON runners(tag);
+CREATE INDEX IF NOT EXISTS idx_runners_status ON runners(status);

@@ -65,6 +65,16 @@ if (existsSync(schemaPath)) {
   console.warn('schema.sql no encontrado, asumiendo DB ya inicializada');
 }
 
+// Migraciones ad-hoc (idempotentes)
+function ensureColumn(table, col, defn) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (!cols.find(c => c.name === col)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${defn}`);
+    console.log(`Migración: ${table}.${col} añadido`);
+  }
+}
+ensureColumn('capital_movements', 'runner_tag', 'TEXT');
+
 // -----------------------------------------------------------------------------
 // Anthropic client (lazy)
 // -----------------------------------------------------------------------------
@@ -214,11 +224,26 @@ const Q = {
   updateOcrLogStockIds: db.prepare(`UPDATE ocr_log SET created_stock_ids = ? WHERE id = ?`),
 
   insertCapital: db.prepare(`
-    INSERT INTO capital_movements (id, type, amount, fecha, source, notas, created_at, updated_at)
-    VALUES (@id, @type, @amount, @fecha, @source, @notas, @created_at, @updated_at)
+    INSERT INTO capital_movements (id, type, amount, fecha, source, notas, runner_tag, created_at, updated_at)
+    VALUES (@id, @type, @amount, @fecha, @source, @notas, @runner_tag, @created_at, @updated_at)
   `),
   allCapital: db.prepare(`SELECT * FROM capital_movements ORDER BY fecha DESC, created_at DESC`),
-  deleteCapital: db.prepare(`DELETE FROM capital_movements WHERE id = ?`)
+  deleteCapital: db.prepare(`DELETE FROM capital_movements WHERE id = ?`),
+
+  insertRunner: db.prepare(`
+    INSERT INTO runners (id, name, tag, commission_pct, contact, status, notas, created_at, updated_at)
+    VALUES (@id, @name, @tag, @commission_pct, @contact, @status, @notas, @created_at, @updated_at)
+  `),
+  updateRunner: db.prepare(`
+    UPDATE runners SET name=@name, commission_pct=@commission_pct, contact=@contact,
+      status=@status, notas=@notas, updated_at=@updated_at
+    WHERE tag=@tag
+  `),
+  allRunners: db.prepare(`SELECT * FROM runners ORDER BY status ASC, name ASC`),
+  getRunner:  db.prepare(`SELECT * FROM runners WHERE tag = ?`),
+  deleteRunner: db.prepare(`DELETE FROM runners WHERE tag = ?`),
+  stockByOrigin: db.prepare(`SELECT * FROM stock WHERE origin = ? ORDER BY bought_date DESC`),
+  capByRunner:   db.prepare(`SELECT * FROM capital_movements WHERE runner_tag = ? ORDER BY fecha DESC`)
 };
 
 // -----------------------------------------------------------------------------
@@ -226,8 +251,9 @@ const Q = {
 // -----------------------------------------------------------------------------
 function calcTreasury() {
   const all = Q.allStock.all().map(applyStatusAuto);
-  const expenses = Q.allExpenses.all();
+  const expenses = Q.allExpenses.all().filter(e => e.modo !== 'porcentaje'); // bot-op % vieja: ignorada
   const capMovs = Q.allCapital.all();
+  const runners = Q.allRunners.all();
   const sumRetail = rows => rows.reduce((s, r) => s + (r.price_retail || 0), 0);
 
   const buckets = {
@@ -242,27 +268,37 @@ function calcTreasury() {
   const capListado   = sumRetail(buckets.listado);
   const capPending   = buckets.pendingPayout.reduce((s, r) => s + (r.sold_at || r.listed_at || r.price_retail || 0), 0);
 
-  // Cash flow real en el banco (Slash)
+  // Separar compras propias vs compras de runner
+  const runnerTags = new Set(runners.map(r => r.tag));
+  const comprasPropias = all.filter(r => !runnerTags.has(r.origin)).reduce((s, r) => s + (r.price_retail || 0), 0);
+  const comprasRunners = all.filter(r => runnerTags.has(r.origin)).reduce((s, r) => s + (r.price_retail || 0), 0);
+  const totalInvertido = comprasPropias + comprasRunners;
+
+  // Capital con runners (asignado − devuelto − gastado en tickets por el runner)
+  const runnerStats = calcRunners(all, capMovs, runners);
+  const capitalConRunners = runnerStats.reduce((s, r) => s + r.disponible, 0);
+  const commisionesPagadas = capMovs.filter(m => m.type === 'commission').reduce((s, m) => s + m.amount, 0);
+
+  // Cash flow real en el banco
   const deposits     = capMovs.filter(m => m.type === 'deposit').reduce((s, m) => s + m.amount, 0);
   const withdrawals  = capMovs.filter(m => m.type === 'withdrawal').reduce((s, m) => s + m.amount, 0);
+  const allocations  = capMovs.filter(m => m.type === 'allocation').reduce((s, m) => s + m.amount, 0);
+  const returns      = capMovs.filter(m => m.type === 'return').reduce((s, m) => s + m.amount, 0);
   const payoutsCobrados = buckets.cobrados.reduce((s, r) => s + (r.payout_amount || 0), 0)
                         + buckets.perdidas.reduce((s, r) => s + (r.payout_amount || 0), 0);
-  const compraTickets   = all.reduce((s, r) => s + (r.price_retail || 0), 0); // todo lo invertido en tickets
   const gastosPagados   = expenses.reduce((s, e) => s + (e.total_pagado || 0), 0);
-  const totalInvertido  = compraTickets;
   const cashback        = totalInvertido * SLASH_CASHBACK_RATE;
 
-  // Cash actualmente en el banco
-  const cashEnBanco = deposits - withdrawals + payoutsCobrados + cashback - compraTickets - gastosPagados;
+  // Cash en banco: salen depositos − retiros − allocations + returns + payouts + cashback − compras propias − gastos − commisiones pagadas
+  // (las compras de runner NO se descuentan: salieron cuando se hizo la allocation)
+  const cashEnBanco = deposits - withdrawals - allocations + returns
+                    + payoutsCobrados + cashback - comprasPropias - gastosPagados - commisionesPagadas;
 
-  // Capital total controlado = cash en banco + valor activo en tickets
-  const capitalTotal = cashEnBanco + capSinListar + capListado + capPending;
+  const capitalTotal = cashEnBanco + capSinListar + capListado + capPending + capitalConRunners;
 
-  // Histórico: profit realizado y pérdidas
   const profitRealizado = buckets.cobrados.reduce((s, r) => s + ((r.payout_amount || 0) - (r.price_retail || 0)), 0);
   const lossesNet       = buckets.perdidas.reduce((s, r) => s + ((r.payout_amount || 0) - (r.price_retail || 0)), 0);
 
-  // < 7 días sin vender
   const lt7 = all.filter(r => {
     if (r.status === 'cobrado' || r.status === 'lost' || r.status === 'sold') return false;
     const d = daysUntil(r.event_date);
@@ -271,21 +307,63 @@ function calcTreasury() {
   const lt7Cap = sumRetail(lt7);
 
   return {
-    capitalTotal,
-    cashback,
-    totalInvertido,
-    cashEnBanco,
-    deposits, withdrawals,
+    capitalTotal, cashback, totalInvertido, cashEnBanco,
+    deposits, withdrawals, allocations, returns,
+    capitalConRunners,
+    runnerStats,
     buckets: {
-      cashEnBanco:  { amount: cashEnBanco, count: capMovs.length, label: 'Cash en Slash' },
-      sinListar:    { amount: capSinListar, count: buckets.sinListar.length },
-      listado:      { amount: capListado,   count: buckets.listado.length },
-      pendingPayout:{ amount: capPending,   count: buckets.pendingPayout.length },
-      profitRealizado: { amount: profitRealizado, count: buckets.cobrados.length },
-      perdidas:     { amount: lossesNet,    count: buckets.perdidas.length }
+      cashEnBanco:      { amount: cashEnBanco, count: capMovs.length, label: 'Cash en Slash' },
+      sinListar:        { amount: capSinListar, count: buckets.sinListar.length },
+      listado:          { amount: capListado,   count: buckets.listado.length },
+      pendingPayout:    { amount: capPending,   count: buckets.pendingPayout.length },
+      capitalConRunners:{ amount: capitalConRunners, count: runners.filter(r => r.status === 'active').length },
+      profitRealizado:  { amount: profitRealizado, count: buckets.cobrados.length },
+      perdidas:         { amount: lossesNet,    count: buckets.perdidas.length }
     },
     lt7: { amount: lt7Cap, count: lt7.length }
   };
+}
+
+// -----------------------------------------------------------------------------
+// calcRunners: para cada runner, calcula sus KPIs
+// -----------------------------------------------------------------------------
+function calcRunners(allStock = null, capMovs = null, runners = null) {
+  if (!allStock) allStock = Q.allStock.all().map(applyStatusAuto);
+  if (!capMovs)  capMovs  = Q.allCapital.all();
+  if (!runners)  runners  = Q.allRunners.all();
+
+  return runners.map(r => {
+    const myStock = allStock.filter(s => s.origin === r.tag);
+    const myMovs  = capMovs.filter(m => m.runner_tag === r.tag);
+
+    const asignado = myMovs.filter(m => m.type === 'allocation').reduce((s, m) => s + m.amount, 0);
+    const devuelto = myMovs.filter(m => m.type === 'return').reduce((s, m) => s + m.amount, 0);
+    const gastado  = myStock.reduce((s, t) => s + (t.price_retail || 0), 0);
+    const disponible = asignado - devuelto - gastado;
+
+    const ticketsTotal = myStock.length;
+    const ticketsVendidos = myStock.filter(s => s.status === 'sold' || s.status === 'cobrado' || s.status === 'lost').length;
+    const ticketsCerrados = myStock.filter(s => s.status === 'cobrado' || s.status === 'lost');
+
+    const profitGenerado = ticketsCerrados.reduce((s, t) => s + ((t.payout_amount || 0) - (t.price_retail || 0)), 0);
+    // Comisión sobre profit positivo SOLO (no le pago % si perdió dinero)
+    const baseComision = ticketsCerrados.reduce((s, t) => {
+      const p = (t.payout_amount || 0) - (t.price_retail || 0);
+      return s + Math.max(0, p);
+    }, 0);
+    const comisionDevengada = baseComision * r.commission_pct;
+    const comisionPagada = myMovs.filter(m => m.type === 'commission').reduce((s, m) => s + m.amount, 0);
+    const comisionPendiente = comisionDevengada - comisionPagada;
+
+    return {
+      ...r,
+      tickets: myStock,
+      asignado, devuelto, gastado, disponible,
+      ticketsTotal, ticketsVendidos,
+      profitGenerado,
+      comisionDevengada, comisionPagada, comisionPendiente
+    };
+  });
 }
 
 function applyStatusAuto(r) {
@@ -682,9 +760,10 @@ app.patch('/api/events/:nombre', (req, res) => {
 // =============================================================================
 app.get('/api/capital', (req, res) => res.json(Q.allCapital.all()));
 
+const CAP_TYPES = new Set(['deposit', 'withdrawal', 'allocation', 'return', 'commission']);
 app.post('/api/capital', (req, res) => {
   try {
-    const type = (req.body.type === 'withdrawal') ? 'withdrawal' : 'deposit';
+    const type = CAP_TYPES.has(req.body.type) ? req.body.type : 'deposit';
     const amount = numOrNull(req.body.amount);
     if (!amount || amount <= 0) throw new Error('amount > 0 requerido');
     const now = nowISO();
@@ -693,11 +772,17 @@ app.post('/api/capital', (req, res) => {
       type,
       amount,
       fecha: req.body.fecha || today(),
-      source: req.body.source || 'Slash transfer',
+      source: req.body.source || (type === 'deposit' ? 'Slash transfer' : null),
       notas: req.body.notas || null,
+      runner_tag: req.body.runner_tag || null,
       created_at: now,
       updated_at: now
     };
+    // Sanity: si es allocation/return/commission, runner_tag obligatorio y debe existir
+    if (['allocation','return','commission'].includes(type)) {
+      if (!row.runner_tag) throw new Error('runner_tag requerido para ' + type);
+      if (!Q.getRunner.get(row.runner_tag)) throw new Error('runner ' + row.runner_tag + ' no existe');
+    }
     Q.insertCapital.run(row);
     res.json({ ok: true, id: row.id });
   } catch (e) { res.status(400).json({ error: e.message }); }
@@ -705,6 +790,51 @@ app.post('/api/capital', (req, res) => {
 
 app.delete('/api/capital/:id', (req, res) => {
   const r = Q.deleteCapital.run(req.params.id);
+  res.json({ ok: r.changes > 0 });
+});
+
+// =============================================================================
+// API — RUNNERS
+// =============================================================================
+app.get('/api/runners', (req, res) => res.json(calcRunners()));
+
+app.post('/api/runners', (req, res) => {
+  try {
+    const name = (req.body.name || '').trim();
+    if (!name) throw new Error('name requerido');
+    const tag = (req.body.tag || slugify(name)).trim().toLowerCase();
+    if (!tag) throw new Error('tag requerido');
+    if (Q.getRunner.get(tag)) throw new Error('Ya existe un runner con tag ' + tag);
+    const pct = numOrNull(req.body.commission_pct);
+    if (pct === null || pct < 0 || pct > 1) throw new Error('commission_pct entre 0 y 1');
+    const now = nowISO();
+    Q.insertRunner.run({
+      id: randomUUID(),
+      name, tag, commission_pct: pct,
+      contact: req.body.contact || null,
+      status: req.body.status || 'active',
+      notas: req.body.notas || null,
+      created_at: now, updated_at: now
+    });
+    res.json({ ok: true, tag });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+app.patch('/api/runners/:tag', (req, res) => {
+  const r = Q.getRunner.get(req.params.tag);
+  if (!r) return res.status(404).json({ error: 'not found' });
+  try {
+    const merged = { ...r, ...req.body, tag: r.tag, updated_at: nowISO() };
+    if (numOrNull(merged.commission_pct) === null) throw new Error('commission_pct invalido');
+    Q.updateRunner.run(merged);
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+app.delete('/api/runners/:tag', (req, res) => {
+  const stock = Q.stockByOrigin.all(req.params.tag);
+  if (stock.length) return res.status(400).json({ error: 'No se puede borrar: tiene ' + stock.length + ' tickets. Cambia status a closed.' });
+  const r = Q.deleteRunner.run(req.params.tag);
   res.json({ ok: r.changes > 0 });
 });
 
@@ -780,9 +910,10 @@ app.get('/', (req, res) => {
   const dash = calcDashboard(dashFrom, dashTo);
 
   res.set('Cache-Control', 'no-store');
+  const runners = calcRunners(stockAll, Q.allCapital.all(), Q.allRunners.all());
   res.send(renderPage({
     user: req.user,
-    treasury, stockAll, stockActive, expenses, eventTabs,
+    treasury, stockAll, stockActive, expenses, eventTabs, runners,
     finalizados, finalizadosPeriod, dash,
     constants: { RETAILERS, SELLING_PLATFORMS, TICKET_TYPES, EXPENSE_CATEGORIES, STATUSES }
   }));
@@ -801,14 +932,14 @@ app.get('/uploads/*', (req, res) => {
 // HTML template
 // =============================================================================
 function renderPage(ctx) {
-  const { treasury, stockActive, expenses, eventTabs, finalizados, dash, constants } = ctx;
+  const { treasury, stockActive, expenses, eventTabs, finalizados, dash, constants, runners } = ctx;
 
   const retailerOptions = constants.RETAILERS.map(r => `<option value="${r}">${r}</option>`).join('');
   const platformOptions = constants.SELLING_PLATFORMS.map(p => `<option value="${esc(p)}">${esc(p)}</option>`).join('');
   const expCatOptions = constants.EXPENSE_CATEGORIES.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('');
 
   const stockRows = stockActive.map(r => renderStockRow(r)).join('');
-  const expenseRows = expenses.map(e => renderExpenseRow(e)).join('');
+  const expenseRows = expenses.filter(e => e.modo !== 'porcentaje').map(e => renderExpenseRow(e)).join('');
   const finalRows = finalizados.map(r => renderFinalRow(r)).join('');
 
   const eventTabsHtml = eventTabs.map(t =>
@@ -865,6 +996,7 @@ function renderPage(ctx) {
   <nav class="tabs stagger">
     <div class="tab tab-treasury active" data-tab="tesoreria">💰 Tesorería</div>
     <div class="tab" data-tab="stock">Stock <span class="tab-badge">${stockActive.length}</span></div>
+    <div class="tab" data-tab="runners">🏃 Runners <span class="tab-badge">${runners.filter(r => r.status === 'active').length}</span></div>
     <div class="tab" data-tab="expenses">Expenses</div>
     <div class="tab" data-tab="dashboard">Dashboard</div>
     <div class="tab" data-tab="finalizados">Finalizados <span class="tab-badge">${finalizados.length}</span></div>
@@ -873,6 +1005,7 @@ function renderPage(ctx) {
 
   ${renderTesoreriaPage(treasury)}
   ${renderStockPage(stockRows, stockActive.length, constants)}
+  ${renderRunnersPage(runners)}
   ${renderExpensesPage(expenseRows, expenses)}
   ${renderDashboardPage(dash)}
   ${renderFinalizadosPage(finalRows, finalizados, ctx.finalizadosPeriod)}
@@ -887,6 +1020,7 @@ function renderPage(ctx) {
 ${renderOcrModal()}
 ${renderEditModal(constants)}
 ${renderCapitalModal()}
+${renderRunnerModal()}
 
 <script>
 window.KEMIN = ${jsonScript({ retailers: constants.RETAILERS, platforms: constants.SELLING_PLATFORMS, ticketTypes: constants.TICKET_TYPES, expenseCats: constants.EXPENSE_CATEGORIES, statuses: constants.STATUSES })};
@@ -913,6 +1047,7 @@ function renderTesoreriaPage(t) {
         </div>
         <div class="treasury-bars">
           ${bar('d-green', '💵 Cash en Slash (disponible)', buckets.cashEnBanco.amount, pct(buckets.cashEnBanco.amount), '--green')}
+          ${buckets.capitalConRunners.amount > 0 ? bar('d-violet', '💼 Capital con runners', buckets.capitalConRunners.amount, pct(buckets.capitalConRunners.amount), '--violet') : ''}
           ${bar('d-cyan', '🛒 Stock sin listar', buckets.sinListar.amount, pct(buckets.sinListar.amount), '--cyan')}
           ${bar('d-blue', '🏷 Stock listado para vender', buckets.listado.amount, pct(buckets.listado.amount), '--blue')}
           ${bar('d-amber', '⏳ Vendido sin payout', buckets.pendingPayout.amount, pct(buckets.pendingPayout.amount), '--amber')}
@@ -929,14 +1064,15 @@ function renderTesoreriaPage(t) {
 
     <div class="collapse-target">
       <div class="kpi-grid stagger">
-        ${kpiCard('💵 Cash en Slash', fmtUSD(buckets.cashEnBanco.amount), `disponible para comprar`, 'accent-green', null, 'Depósitos − retiros + payouts + cashback − compras − gastos')}
+        ${kpiCard('💵 Cash en Slash', fmtUSD(buckets.cashEnBanco.amount), `disponible para comprar`, 'accent-green', null, 'Depósitos − retiros − allocations + returns + payouts + cashback − compras propias − gastos − comisiones pagadas')}
+        ${buckets.capitalConRunners.amount > 0 ? kpiCard('💼 Capital con runners', fmtUSD(buckets.capitalConRunners.amount), `${buckets.capitalConRunners.count} runners activos`, 'accent-violet clickable', null, 'Capital asignado a runners aún no gastado en tickets ni devuelto. Click → tab Runners.') : ''}
         ${kpiCard('🛒 Stock sin listar', fmtUSD(buckets.sinListar.amount), `${buckets.sinListar.count} tickets · esperando publicación`, 'accent-cyan clickable', 'comprado')}
         ${kpiCard('🏷 Stock listado', fmtUSD(buckets.listado.amount), `${buckets.listado.count} tickets · en marketplaces`, 'accent-blue clickable', 'listed')}
         ${kpiCard('⏳ Vendido sin payout', fmtUSD(buckets.pendingPayout.amount), `${buckets.pendingPayout.count} tickets · pendiente cobro`, 'accent-amber clickable', 'sold')}
         ${kpiCard('✅ Profit realizado', (buckets.profitRealizado.amount >= 0 ? '+' : '') + fmtUSD(buckets.profitRealizado.amount), `${buckets.profitRealizado.count} cerrados con beneficio`, 'accent-green clickable', 'cobrado')}
         ${kpiCard('📉 Pérdidas realizadas', fmtUSD(buckets.perdidas.amount), `${buckets.perdidas.count} tickets cerrados a pérdida`, 'accent-red clickable', 'lost')}
         ${kpiCard('⏰ < 7 días, sin vender', fmtUSD(t.lt7.amount), `${t.lt7.count} tickets · urge bajar precio`, 'clickable', null)}
-        ${kpiCard('💳 Cashback Slash (2%)', fmtUSD(t.cashback), `${fmtUSD(t.totalInvertido)} invertido × 2%`, 'accent-green', null, 'Slash devuelve 2% por cada compra. Sumado al cash en banco.')}
+        ${kpiCard('💳 Cashback Slash (2%)', fmtUSD(t.cashback), `${fmtUSD(t.totalInvertido)} invertido × 2%`, 'accent-green', null, 'Slash devuelve 2% por cada compra (incluidas compras de runners). Sumado al cash.')}
       </div>
     </div>
   </section>`;
@@ -1062,21 +1198,22 @@ function statusToPill(s) {
 }
 
 function renderExpensesPage(rowsHtml, expenses) {
-  const ytd = expenses.reduce((s, e) => s + (e.total_pagado || 0), 0);
-  const recurrente = expenses.filter(e => e.recurrente && e.modo === 'fijo').reduce((s, e) => s + (e.precio_mes || 0), 0);
-  const botops = expenses.filter(e => e.modo === 'porcentaje').reduce((s, e) => s + (e.total_pagado || 0), 0);
+  // Filtramos los bot-op viejos (modo='porcentaje') — ahora viven en tab Runners
+  const fixedExpenses = expenses.filter(e => e.modo !== 'porcentaje');
+  const ytd = fixedExpenses.reduce((s, e) => s + (e.total_pagado || 0), 0);
+  const recurrente = fixedExpenses.filter(e => e.recurrente).reduce((s, e) => s + (e.precio_mes || 0), 0);
   const thisMonth = today().slice(0, 7);
-  const mes = expenses.filter(e => e.fecha.startsWith(thisMonth)).reduce((s, e) => s + (e.total_pagado || 0), 0);
+  const mes = fixedExpenses.filter(e => e.fecha.startsWith(thisMonth)).reduce((s, e) => s + (e.total_pagado || 0), 0);
   return `
   <section class="page" id="page-expenses">
     <h1 class="section-title collapsible"><span class="chev">▾</span> Resumen Expenses</h1>
-    <p class="section-sub">Proxies, bots, suscripciones, servidor, comisiones bot-op.</p>
+    <p class="section-sub">Proxies, bots, suscripciones, servidor. <strong>Comisiones a runners</strong> → tab 🏃 Runners.</p>
 
     <div class="kpi-grid stagger collapse-target">
-      ${kpiCard('Gastos totales (YTD)', fmtUSD(ytd), `${expenses.length} líneas`, '')}
-      ${kpiCard('Mensualidad fija', fmtUSD(recurrente) + '<span class="unit">/mes</span>', `${expenses.filter(e => e.recurrente && e.modo === 'fijo').length} suscripciones`, 'accent-cyan')}
-      ${kpiCard('🤖 Comisiones bot-op', fmtUSD(botops), 'sobre profit acumulado', 'accent-violet', null, 'Operadores externos que cobran % sobre profit')}
+      ${kpiCard('Gastos totales (YTD)', fmtUSD(ytd), `${fixedExpenses.length} líneas`, '')}
+      ${kpiCard('Mensualidad fija', fmtUSD(recurrente) + '<span class="unit">/mes</span>', `${fixedExpenses.filter(e => e.recurrente).length} suscripciones`, 'accent-cyan')}
       ${kpiCard('Gasto este mes', fmtUSD(mes), 'mes en curso', 'accent-amber')}
+      ${kpiCard('% sobre profit', '—', 'se calcula en Dashboard', 'accent-mute')}
     </div>
 
     <h1 class="section-title collapsible" style="margin-top: 24px;"><span class="chev">▾</span> Listado de gastos</h1>
@@ -1095,15 +1232,14 @@ function renderExpensesPage(rowsHtml, expenses) {
               <th>Gasto</th>
               <th>Fecha</th>
               <th>Categoría</th>
-              <th>Modo</th>
               <th>Recurrente</th>
-              <th class="num">Precio / %</th>
-              <th class="num">Base</th>
+              <th class="num">Precio/mes</th>
+              <th class="num">Meses</th>
               <th class="num">Total pagado</th>
               <th class="row-actions">⋯</th>
             </tr>
           </thead>
-          <tbody>${rowsHtml || `<tr><td colspan="9" style="text-align:center;color:var(--text-mute);padding:32px;">Sin gastos aún. Click <strong>＋ Nuevo gasto</strong>.</td></tr>`}</tbody>
+          <tbody>${rowsHtml || `<tr><td colspan="8" style="text-align:center;color:var(--text-mute);padding:32px;">Sin gastos aún. Click <strong>＋ Nuevo gasto</strong>.</td></tr>`}</tbody>
         </table>
       </div>
     </div>
@@ -1111,28 +1247,19 @@ function renderExpensesPage(rowsHtml, expenses) {
 }
 
 function renderExpenseRow(e) {
-  const modoPill = e.modo === 'porcentaje'
-    ? '<span class="pill pill-cyan">% ganancia</span>'
-    : '<span class="pill pill-mute">Fijo</span>';
   const recurrentePill = e.recurrente ? '<span class="pill pill-yes">Sí</span>' : '<span class="pill pill-no">No</span>';
-  const precio = e.modo === 'porcentaje' ? ((e.porcentaje || 0) * 100).toFixed(1) + '%' : fmtUSD(e.precio_mes, 2);
-  const base = e.modo === 'porcentaje'
-    ? `${fmtUSD(e.base_profit, 0)} profit`
-    : `${e.base_meses || 1} ${e.base_meses === 1 ? 'pago' : 'meses'}`;
   const catPillCls = {
     'Proxy': 'pill-cyan', 'Bot': 'pill-violet', 'Suscripción': 'pill-blue',
-    'Servidor': 'pill-cyan', 'Bot operator': 'pill-violet', 'Otro': 'pill-mute'
+    'Servidor': 'pill-cyan', 'Otro': 'pill-mute'
   }[e.categoria || 'Otro'] || 'pill-mute';
-  const nombrePrefix = e.modo === 'porcentaje' ? '🤖 ' : '';
   return `
   <tr data-id="${escAttr(e.id)}">
-    <td><strong>${nombrePrefix}${esc(e.nombre)}</strong></td>
+    <td><strong>${esc(e.nombre)}</strong></td>
     <td>${fmtDateShort(e.fecha)}</td>
     <td><span class="pill ${catPillCls}">${esc(e.categoria || 'Otro')}</span></td>
-    <td>${modoPill}</td>
     <td>${recurrentePill}</td>
-    <td class="num">${precio}</td>
-    <td class="num">${base}</td>
+    <td class="num">${fmtUSD(e.precio_mes, 2)}</td>
+    <td class="num">${e.base_meses || 1}</td>
     <td class="num">${fmtUSD(e.total_pagado, 2)}</td>
     <td><button class="row-menu" onclick="rowMenu(event, 'expense', '${escAttr(e.id)}')">⋯</button></td>
   </tr>`;
@@ -1310,6 +1437,115 @@ function renderEventPage(t) {
   </section>`;
 }
 
+function renderRunnersPage(runners) {
+  const activos = runners.filter(r => r.status === 'active');
+  const otros   = runners.filter(r => r.status !== 'active');
+  return `
+  <section class="page" id="page-runners">
+    <h1 class="section-title collapsible"><span class="chev">▾</span> 🏃 Runners</h1>
+    <p class="section-sub">Personas externas que compran tickets para KEMIN con tarjetas Slash asignadas. Comisión = % sobre profit neto.</p>
+
+    <div class="collapse-target">
+      <div class="toolbar">
+        <div class="spacer"></div>
+        <button class="btn" onclick="openRunnerModal(null)">＋ Nuevo runner</button>
+      </div>
+
+      ${activos.length === 0 && otros.length === 0
+        ? `<div style="background: var(--surface); border: 1px dashed var(--border); border-radius: 14px; padding: 40px; text-align: center; color: var(--text-mute);">
+            Aún no hay runners. Click <strong>＋ Nuevo runner</strong> para añadir el primero.
+          </div>`
+        : activos.map(renderRunnerCard).join('') + (otros.length ? `<h2 style="font-family:'Playfair Display',serif;font-size:18px;margin:32px 0 14px;color:var(--text-dim);">Pausados / cerrados</h2>` + otros.map(renderRunnerCard).join('') : '')
+      }
+    </div>
+  </section>`;
+}
+
+function renderRunnerCard(r) {
+  const statusBadge = {
+    active: '<span class="pill pill-yes">🟢 Activo</span>',
+    paused: '<span class="pill pill-pending">⏸ Pausado</span>',
+    closed: '<span class="pill pill-mute">⊘ Cerrado</span>'
+  }[r.status] || '';
+  const ticketsClosed = r.tickets.filter(t => t.status === 'cobrado' || t.status === 'lost').length;
+  const rows = r.tickets.length
+    ? r.tickets.slice(0, 25).map(t => {
+        const profit = (t.payout_amount || 0) - (t.price_retail || 0);
+        const closed = t.status === 'cobrado' || t.status === 'lost';
+        return `<tr><td><strong>${esc(t.evento)}</strong></td><td>${fmtDateShort(t.bought_date)}</td><td>${retailerTag(t.retailer)}</td><td class="num">${fmtUSD(t.price_retail)}</td><td class="num">${fmtUSD(t.payout_amount, 2)}</td><td class="num ${profit > 0 ? 'profit-pos' : profit < 0 ? 'profit-neg' : ''}">${closed ? (profit >= 0 ? '+' : '') + fmtUSD(profit) : '—'}</td><td>${statusToPill(t.status)}</td></tr>`;
+      }).join('')
+    : `<tr><td colspan="7" style="text-align:center;color:var(--text-mute);padding:24px;">Sin tickets aún. Cuando registres tickets en Stock con <code style="background:var(--surface-3);padding:2px 6px;border-radius:4px;">origin = ${esc(r.tag)}</code> aparecerán aquí.</td></tr>`;
+  const moreRows = r.tickets.length > 25 ? `<tr><td colspan="7" style="text-align:center;color:var(--text-mute);padding:10px;">+${r.tickets.length - 25} más · <a href="#stock" onclick="document.querySelector('.tab[data-tab=stock]').click()" style="color:var(--cyan)">ver en Stock</a></td></tr>` : '';
+
+  return `
+  <div class="runner-card">
+    <div class="runner-header">
+      <div>
+        <h2><span class="runner-name">${esc(r.name)}</span> <span class="runner-tag">${esc(r.tag)}</span> ${statusBadge}</h2>
+        <p class="runner-meta">${(r.commission_pct * 100).toFixed(1)}% comisión sobre profit ${r.contact ? '· ' + esc(r.contact) : ''}</p>
+      </div>
+      <div style="display: flex; gap: 8px;">
+        <button class="btn btn-ghost" onclick="openCapModal('allocation', '${escAttr(r.tag)}', '${escAttr(r.name)}')">＋ Asignar capital</button>
+        <button class="btn btn-ghost" onclick="openCapModal('return', '${escAttr(r.tag)}', '${escAttr(r.name)}')">⤓ Devolución</button>
+        <button class="btn btn-ghost" onclick="openCapModal('commission', '${escAttr(r.tag)}', '${escAttr(r.name)}')" ${r.comisionPendiente <= 0 ? 'disabled' : ''}>💸 Pagar comisión</button>
+        <button class="row-menu" onclick="rowMenu(event, 'runner', '${escAttr(r.tag)}')">⋯</button>
+      </div>
+    </div>
+
+    <div class="runner-kpis">
+      <div class="rk"><div class="l">💼 Asignado</div><div class="v">${fmtUSD(r.asignado)}</div></div>
+      <div class="rk"><div class="l">💸 Gastado</div><div class="v">${fmtUSD(r.gastado)}</div></div>
+      <div class="rk"><div class="l">💵 Disponible</div><div class="v" style="color: var(--green);">${fmtUSD(r.disponible)}</div></div>
+      <div class="rk-sep"></div>
+      <div class="rk"><div class="l">🎟 Tickets</div><div class="v">${r.ticketsVendidos}/${r.ticketsTotal}</div></div>
+      <div class="rk"><div class="l">✅ Profit generado</div><div class="v" style="color: ${r.profitGenerado >= 0 ? 'var(--green)' : 'var(--red)'};">${r.profitGenerado >= 0 ? '+' : ''}${fmtUSD(r.profitGenerado)}</div></div>
+      <div class="rk-sep"></div>
+      <div class="rk"><div class="l">💰 Devengada</div><div class="v">${fmtUSD(r.comisionDevengada, 2)}</div></div>
+      <div class="rk"><div class="l">✓ Pagada</div><div class="v">${fmtUSD(r.comisionPagada, 2)}</div></div>
+      <div class="rk"><div class="l">⏳ Pendiente</div><div class="v" style="color: ${r.comisionPendiente > 0 ? 'var(--amber)' : 'var(--text-dim)'};">${fmtUSD(r.comisionPendiente, 2)}</div></div>
+    </div>
+
+    <details class="runner-tickets">
+      <summary>${r.tickets.length} ticket${r.tickets.length === 1 ? '' : 's'} de ${esc(r.name)}</summary>
+      <div class="table-wrap" style="margin-top: 10px;">
+        <table>
+          <thead><tr><th>Evento</th><th>Bought</th><th>Retailer</th><th class="num">Retail</th><th class="num">Payout</th><th class="num">Profit</th><th>Estado</th></tr></thead>
+          <tbody>${rows}${moreRows}</tbody>
+        </table>
+      </div>
+    </details>
+  </div>`;
+}
+
+function renderRunnerModal() {
+  return `
+<div class="modal-overlay" id="runner-modal">
+  <div class="modal" style="max-width: 560px;">
+    <div class="modal-header">
+      <h2 id="runner-modal-title">🏃 Nuevo runner</h2>
+      <button class="close" onclick="closeModal('runner-modal')">✕</button>
+    </div>
+    <div class="modal-body" style="grid-template-columns: 1fr; padding: 24px 28px;">
+      <form id="runner-form" onsubmit="return saveRunner(event)">
+        <input type="hidden" name="_originalTag" />
+        <div class="ocr-field"><label>Nombre *</label><input type="text" name="name" required placeholder="Joey" /></div>
+        <div class="ocr-field-row">
+          <div class="ocr-field"><label>Tag (slug) *</label><input type="text" name="tag" required placeholder="joey" pattern="[a-z0-9_-]+" /></div>
+          <div class="ocr-field"><label>Comisión % (0.15 = 15%) *</label><input type="number" step="0.01" min="0" max="1" name="commission_pct" required placeholder="0.15" /></div>
+          <div class="ocr-field"><label>Status</label><select name="status"><option value="active">🟢 Activo</option><option value="paused">⏸ Pausado</option><option value="closed">⊘ Cerrado</option></select></div>
+        </div>
+        <div class="ocr-field"><label>Contacto (opcional)</label><input type="text" name="contact" placeholder="@joeytickets · joey@telegram" /></div>
+        <div class="ocr-field"><label>Notas (opcional)</label><input type="text" name="notas" /></div>
+        <div style="display: flex; gap: 10px; justify-content: flex-end; margin-top: 22px;">
+          <button type="button" class="btn btn-ghost" onclick="closeModal('runner-modal')">Cancelar</button>
+          <button type="submit" class="btn">✓ Guardar</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>`;
+}
+
 function renderCapitalModal() {
   return `
 <div class="modal-overlay" id="capital-modal">
@@ -1321,10 +1557,12 @@ function renderCapitalModal() {
     <div class="modal-body" style="grid-template-columns: 1fr; padding: 24px 28px;">
       <form id="capital-form" onsubmit="return saveCapital(event)">
         <input type="hidden" name="type" value="deposit" />
+        <input type="hidden" name="runner_tag" value="" />
+        <p id="capital-form-info" style="font-size: 12px; color: var(--text-mute); margin-bottom: 14px;"></p>
         <div class="ocr-field"><label>Cantidad (USD) *</label><input type="number" step="0.01" name="amount" required placeholder="25000" /></div>
         <div class="ocr-field-row">
           <div class="ocr-field"><label>Fecha</label><input type="date" name="fecha" /></div>
-          <div class="ocr-field" style="grid-column: span 2;"><label>Origen</label><input type="text" name="source" placeholder="Slash transfer" value="Slash transfer" /></div>
+          <div class="ocr-field" style="grid-column: span 2;"><label>Origen / Concepto</label><input type="text" name="source" placeholder="Slash transfer" value="Slash transfer" /></div>
         </div>
         <div class="ocr-field"><label>Notas (opcional)</label><input type="text" name="notas" placeholder="ej. capital inicial Fer+Kevin 50/50" /></div>
         <div style="display: flex; gap: 10px; justify-content: flex-end; margin-top: 22px;">
@@ -1450,23 +1688,20 @@ function renderEditModal(constants) {
         </div>
 
         <div id="edit-expense-fields" style="display:none;">
+          <input type="hidden" name="modo" value="fijo" />
           <div class="ocr-field"><label>Nombre *</label><input type="text" name="nombre" /></div>
           <div class="ocr-field-row">
             <div class="ocr-field"><label>Fecha</label><input type="date" name="fecha" /></div>
             <div class="ocr-field"><label>Categoría</label><select name="categoria">${expCatOpts}</select></div>
-            <div class="ocr-field"><label>Modo</label><select name="modo" onchange="toggleExpenseMode(this.value)"><option value="fijo">Fijo</option><option value="porcentaje">% sobre ganancia</option></select></div>
-          </div>
-          <div class="ocr-field-row" id="exp-fijo-fields">
-            <div class="ocr-field"><label>Precio / mes (USD)</label><input type="number" step="0.01" name="precio_mes" /></div>
-            <div class="ocr-field"><label>Meses pagados</label><input type="number" name="base_meses" value="1" /></div>
             <div class="ocr-field"><label>Recurrente</label><select name="recurrente"><option value="0">No</option><option value="1">Sí</option></select></div>
           </div>
-          <div class="ocr-field-row" id="exp-pct-fields" style="display:none;">
-            <div class="ocr-field"><label>% sobre profit (0.15 = 15%)</label><input type="number" step="0.01" name="porcentaje" placeholder="0.15" /></div>
-            <div class="ocr-field"><label>Bot origin tag</label><input type="text" name="bot_origin_tag" placeholder="JoeyTickets" /></div>
-            <div class="ocr-field"><label>Base profit (auto si tag)</label><input type="number" step="0.01" name="base_profit" /></div>
+          <div class="ocr-field-row">
+            <div class="ocr-field"><label>Precio / mes (USD)</label><input type="number" step="0.01" name="precio_mes" /></div>
+            <div class="ocr-field"><label>Meses pagados</label><input type="number" name="base_meses" value="1" /></div>
+            <div class="ocr-field"></div>
           </div>
           <div class="ocr-field"><label>Notas</label><input type="text" name="notas" /></div>
+          <p style="font-size:11px;color:var(--text-mute);margin-top:8px;">💡 Comisiones a runners no se gestionan aquí. Ve a la tab <strong>🏃 Runners</strong>.</p>
         </div>
 
         <div style="display: flex; gap: 10px; justify-content: flex-end; margin-top: 22px;">
@@ -1694,6 +1929,39 @@ tr:hover .row-menu { color: var(--text-dim); }
 .row-menu-dropdown button.danger:hover { background: rgba(239,68,68,0.1); }
 .mockup-note { margin-top: 40px; padding: 16px 20px; background: rgba(16,185,129,0.05);
   border: 1px dashed rgba(16,185,129,0.3); border-radius: 10px; color: #6ee7b7; font-size: 12px; text-align: center; }
+.runner-card { background: linear-gradient(135deg, var(--surface) 0%, var(--surface-2) 100%);
+  border: 1px solid var(--border); border-radius: 16px; padding: 22px 26px; margin-bottom: 16px;
+  position: relative; overflow: hidden; }
+.runner-card::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+  background: linear-gradient(180deg, var(--violet), var(--cyan)); }
+.runner-header { display: flex; justify-content: space-between; align-items: flex-start;
+  margin-bottom: 18px; flex-wrap: wrap; gap: 12px; }
+.runner-header h2 { font-family: 'Playfair Display', serif; font-size: 22px; font-weight: 700;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.runner-tag { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--cyan-soft);
+  background: rgba(34,211,238,0.1); border: 1px solid rgba(34,211,238,0.2); padding: 2px 8px;
+  border-radius: 6px; font-weight: 500; letter-spacing: 0.5px; }
+.runner-name { font-style: italic; }
+.runner-meta { font-size: 12px; color: var(--text-mute); margin-top: 4px; }
+.runner-kpis { display: flex; gap: 18px; flex-wrap: wrap; align-items: center;
+  padding: 16px; background: var(--bg-2); border-radius: 12px; border: 1px solid var(--border-soft); }
+.runner-kpis .rk { flex: 1 1 auto; min-width: 100px; }
+.runner-kpis .rk .l { font-size: 10px; text-transform: uppercase; letter-spacing: 1px;
+  color: var(--text-mute); margin-bottom: 4px; font-weight: 600; }
+.runner-kpis .rk .v { font-family: 'JetBrains Mono', monospace; font-size: 16px; font-weight: 600; color: var(--text); }
+.runner-kpis .rk-sep { width: 1px; background: var(--border); align-self: stretch; }
+.runner-tickets { margin-top: 16px; }
+.runner-tickets summary { cursor: pointer; font-size: 12px; color: var(--text-dim); padding: 8px 0;
+  user-select: none; list-style: none; display: flex; align-items: center; gap: 6px; }
+.runner-tickets summary::before { content: '▸'; transition: transform 0.2s; color: var(--cyan); }
+.runner-tickets[open] summary::before { transform: rotate(90deg); }
+.runner-tickets summary:hover { color: var(--text); }
+.d-violet { background: var(--violet); }
+.kpi.accent-violet { }
+@media (max-width: 700px) {
+  .runner-kpis { gap: 12px; }
+  .runner-kpis .rk-sep { display: none; }
+}
 @media (max-width: 900px) {
   .chart-row, .chart-row.equal { grid-template-columns: 1fr; }
   .event-banner { flex-direction: column; gap: 16px; align-items: flex-start; }
@@ -1753,6 +2021,12 @@ document.querySelectorAll('.kpi.clickable[data-stock-filter]').forEach(k => {
     if (sel) { sel.value = filter; sel.dispatchEvent(new Event('change')); }
   });
 });
+// Treasury → runners tab
+document.querySelectorAll('.kpi.clickable').forEach(k => {
+  if (k.querySelector('.kpi-label')?.textContent.includes('Capital con runners')) {
+    k.addEventListener('click', () => document.querySelector('.tab[data-tab="runners"]').click());
+  }
+});
 // Stock search & filters
 function applyStockFilters() {
   const q = (document.getElementById('stock-search')?.value || '').toLowerCase();
@@ -1787,14 +2061,19 @@ window.rowMenu = function(e, kind, id) {
   const dd = document.createElement('div');
   dd.className = 'row-menu-dropdown';
   const opts = [
-    { label: '✏ Editar', fn: () => openEditModal(kind, id) },
-    { label: '📋 Duplicar', fn: () => duplicateRow(kind, id) },
+    { label: '✏ Editar', fn: () => kind === 'runner' ? openRunnerModal(id) : openEditModal(kind, id) },
+    ...(kind !== 'runner' ? [{ label: '📋 Duplicar', fn: () => duplicateRow(kind, id) }] : []),
     ...(kind === 'stock' ? [
       { label: '🏷 Marcar Listed', fn: () => quickPatch(kind, id, { status: 'listed', listed_at: prompt('Listed at (USD)?') }) },
       { label: '💵 Marcar Sold', fn: () => quickPatch(kind, id, { status: 'sold', sold_at: prompt('Sold at (USD)?'), sold_date: new Date().toISOString().slice(0,10) }) },
       { label: '✅ Marcar Cobrado', fn: () => quickPatch(kind, id, { status: 'cobrado', payout_amount: prompt('Payout amount (USD)?'), payout_date: new Date().toISOString().slice(0,10) }) }
     ] : []),
-    { label: '🗑 Eliminar', cls: 'danger', fn: () => deleteRow(kind, id) }
+    ...(kind === 'runner' ? [
+      { label: '⏸ Pausar', fn: () => quickPatchRunner(id, { status: 'paused' }) },
+      { label: '🟢 Activar', fn: () => quickPatchRunner(id, { status: 'active' }) },
+      { label: '⊘ Cerrar', fn: () => quickPatchRunner(id, { status: 'closed' }) }
+    ] : []),
+    { label: '🗑 Eliminar', cls: 'danger', fn: () => kind === 'runner' ? deleteRunner(id) : deleteRow(kind, id) }
   ];
   for (const o of opts) {
     const b = document.createElement('button');
@@ -1823,6 +2102,15 @@ window.deleteRow = async function(kind, id) {
   const url = kind === 'stock' ? '/api/stock/' + id : '/api/expenses/' + id;
   const r = await fetch(url, { method: 'DELETE' });
   if (r.ok) softReload(); else alert('Error');
+};
+window.quickPatchRunner = async function(tag, body) {
+  const r = await fetch('/api/runners/' + tag, { method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  if (r.ok) softReload(); else alert('Error: ' + (await r.text()));
+};
+window.deleteRunner = async function(tag) {
+  if (!confirm('¿Eliminar runner ' + tag + '?')) return;
+  const r = await fetch('/api/runners/' + tag, { method: 'DELETE' });
+  if (r.ok) softReload(); else alert('Error: ' + (await r.text()));
 };
 window.duplicateRow = async function(kind, id) {
   const url = kind === 'stock' ? '/api/stock' : '/api/expenses';
@@ -1962,14 +2250,30 @@ window.saveEdit = async function(ev) {
   else alert('Error: ' + (await r.text()));
   return false;
 };
-// Capital modal
-window.openCapitalModal = function(type) {
+// Capital modal — soporta deposit, withdrawal, allocation, return, commission
+const CAP_LABELS = {
+  deposit: { title: '💵 Inyección de capital (deposit)', info: 'Entra cash en el banco Slash.', source: 'Slash transfer' },
+  withdrawal: { title: '⤓ Retiro de capital', info: 'Sale cash del banco Slash a una cuenta externa.', source: '' },
+  allocation: { title: '＋ Asignar capital a runner', info: '', source: 'Allocation' },
+  return: { title: '⤓ Devolución de capital del runner', info: '', source: 'Return' },
+  commission: { title: '💸 Pagar comisión al runner', info: '', source: 'Commission payment' }
+};
+window.openCapitalModal = function(type) { window.openCapModal(type, null, null); };
+window.openCapModal = function(type, runnerTag, runnerName) {
   const form = document.getElementById('capital-form');
   form.reset();
   form.elements['type'].value = type;
+  form.elements['runner_tag'].value = runnerTag || '';
   form.elements['fecha'].value = new Date().toISOString().slice(0,10);
-  document.getElementById('capital-modal-title').textContent =
-    type === 'deposit' ? '💵 Inyección de capital (deposit)' : '⤓ Retiro de capital (withdrawal)';
+  form.elements['source'].value = CAP_LABELS[type]?.source || '';
+  document.getElementById('capital-modal-title').textContent = CAP_LABELS[type]?.title || type;
+  const info = document.getElementById('capital-form-info');
+  if (runnerTag) {
+    const verb = type === 'allocation' ? 'Asignar a' : type === 'return' ? 'Devolución de' : 'Pagar comisión a';
+    info.innerHTML = '🏃 <strong style="color: var(--violet);">' + verb + ' ' + runnerName + '</strong> (' + runnerTag + ')';
+  } else {
+    info.textContent = CAP_LABELS[type]?.info || '';
+  }
   openModal('capital-modal');
 };
 window.saveCapital = async function(ev) {
@@ -1977,8 +2281,52 @@ window.saveCapital = async function(ev) {
   const form = document.getElementById('capital-form');
   const fd = new FormData(form);
   const body = Object.fromEntries(fd);
+  if (!body.runner_tag) delete body.runner_tag;
   const r = await fetch('/api/capital', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
   if (r.ok) { closeModal('capital-modal'); softReload(); }
+  else alert('Error: ' + (await r.text()));
+  return false;
+};
+
+// Runner modal
+window.openRunnerModal = async function(tag) {
+  const form = document.getElementById('runner-form');
+  form.reset();
+  form.elements['_originalTag'].value = tag || '';
+  document.getElementById('runner-modal-title').textContent = tag ? '🏃 Editar runner' : '🏃 Nuevo runner';
+  if (tag) {
+    const list = await (await fetch('/api/runners')).json();
+    const r = list.find(x => x.tag === tag);
+    if (r) {
+      form.elements['name'].value = r.name;
+      form.elements['tag'].value = r.tag;
+      form.elements['tag'].readOnly = true;
+      form.elements['commission_pct'].value = r.commission_pct;
+      form.elements['status'].value = r.status;
+      form.elements['contact'].value = r.contact || '';
+      form.elements['notas'].value = r.notas || '';
+    }
+  } else {
+    form.elements['tag'].readOnly = false;
+    // auto slug as user types
+    form.elements['name'].oninput = (e) => {
+      if (!form.elements['_userEditedTag']?.value) {
+        form.elements['tag'].value = e.target.value.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/(^-|-$)/g,'');
+      }
+    };
+  }
+  openModal('runner-modal');
+};
+window.saveRunner = async function(ev) {
+  ev.preventDefault();
+  const form = document.getElementById('runner-form');
+  const fd = new FormData(form);
+  const body = Object.fromEntries(fd);
+  const originalTag = body._originalTag; delete body._originalTag;
+  const url = originalTag ? '/api/runners/' + originalTag : '/api/runners';
+  const method = originalTag ? 'PATCH' : 'POST';
+  const r = await fetch(url, { method, headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  if (r.ok) { closeModal('runner-modal'); softReload(); }
   else alert('Error: ' + (await r.text()));
   return false;
 };
