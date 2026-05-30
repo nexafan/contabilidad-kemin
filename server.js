@@ -1708,17 +1708,38 @@ tr:hover .row-menu { color: var(--text-dim); }
 
 const CLIENT_JS = `
 // Tabs
+function activateTab(target, opts = {}) {
+  const tab = document.querySelector('.tab[data-tab="' + target + '"]');
+  if (!tab) return false;
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  tab.classList.add('active');
+  const page = document.getElementById('page-' + target);
+  if (page) page.classList.add('active');
+  if (opts.scroll !== false) window.scrollTo({ top: 0, behavior: 'smooth' });
+  if (opts.updateHash !== false) history.replaceState(null, '', '#' + target);
+  return true;
+}
 document.querySelectorAll('.tab').forEach(tab => {
-  tab.addEventListener('click', () => {
-    const target = tab.dataset.tab;
-    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-    tab.classList.add('active');
-    const page = document.getElementById('page-' + target);
-    if (page) page.classList.add('active');
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-  });
+  tab.addEventListener('click', () => activateTab(tab.dataset.tab));
 });
+// Restaurar tab desde URL hash al cargar (sobrevive a location.reload)
+(function restoreTab() {
+  const hash = location.hash.slice(1);
+  if (hash) activateTab(hash, { scroll: false, updateHash: false });
+  // Restaurar posición de scroll si veníamos de un save (sessionStorage)
+  const sy = sessionStorage.getItem('kemin_scroll');
+  if (sy) {
+    sessionStorage.removeItem('kemin_scroll');
+    setTimeout(() => window.scrollTo(0, parseInt(sy, 10)), 30);
+  }
+})();
+// Helper: guardar estado antes de un reload tras CRUD
+window.softReload = function() {
+  sessionStorage.setItem('kemin_scroll', String(window.scrollY));
+  // El hash ya está en URL, location.reload() lo conserva
+  location.reload();
+};
 // Collapsibles
 document.querySelectorAll('.section-title.collapsible').forEach(t => {
   t.addEventListener('click', () => t.classList.toggle('collapsed'));
@@ -1795,13 +1816,13 @@ window.quickPatch = async function(kind, id, body) {
   if (Object.values(body).some(v => v === null)) return; // user cancelled prompt
   const url = kind === 'stock' ? '/api/stock/' + id : '/api/expenses/' + id;
   const r = await fetch(url, { method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
-  if (r.ok) location.reload(); else alert('Error: ' + (await r.text()));
+  if (r.ok) softReload(); else alert('Error: ' + (await r.text()));
 };
 window.deleteRow = async function(kind, id) {
   if (!confirm('¿Eliminar definitivamente?')) return;
   const url = kind === 'stock' ? '/api/stock/' + id : '/api/expenses/' + id;
   const r = await fetch(url, { method: 'DELETE' });
-  if (r.ok) location.reload(); else alert('Error');
+  if (r.ok) softReload(); else alert('Error');
 };
 window.duplicateRow = async function(kind, id) {
   const url = kind === 'stock' ? '/api/stock' : '/api/expenses';
@@ -1810,7 +1831,7 @@ window.duplicateRow = async function(kind, id) {
   if (!src) return;
   const copy = {...src}; delete copy.id; delete copy.created_at; delete copy.updated_at;
   const r = await fetch(url, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(copy) });
-  if (r.ok) location.reload();
+  if (r.ok) softReload();
 };
 // Modals
 window.openModal = id => document.getElementById(id)?.classList.add('open');
@@ -1897,7 +1918,7 @@ window.confirmOcr = async function() {
   const items = Array.from({length: n}, () => ({...obj}));
   const body = { items, ocr_log_id: window.__ocr?.ocr_log_id };
   const r = await fetch('/api/stock/bulk', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
-  if (r.ok) { closeModal('ocr-modal'); location.reload(); }
+  if (r.ok) { closeModal('ocr-modal'); softReload(); }
   else alert('Error: ' + (await r.text()));
 };
 // Edit modal
@@ -1937,7 +1958,7 @@ window.saveEdit = async function(ev) {
   const url = id ? base + '/' + id : base;
   const method = id ? 'PATCH' : 'POST';
   const r = await fetch(url, { method, headers: {'Content-Type':'application/json'}, body: JSON.stringify(obj) });
-  if (r.ok) { closeModal('edit-modal'); location.reload(); }
+  if (r.ok) { closeModal('edit-modal'); softReload(); }
   else alert('Error: ' + (await r.text()));
   return false;
 };
@@ -1957,7 +1978,7 @@ window.saveCapital = async function(ev) {
   const fd = new FormData(form);
   const body = Object.fromEntries(fd);
   const r = await fetch('/api/capital', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
-  if (r.ok) { closeModal('capital-modal'); location.reload(); }
+  if (r.ok) { closeModal('capital-modal'); softReload(); }
   else alert('Error: ' + (await r.text()));
   return false;
 };
