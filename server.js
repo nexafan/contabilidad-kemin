@@ -820,7 +820,10 @@ function renderPage(ctx) {
 <html lang="es"><head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>KEMIN LLC · Panel de Tickets</title>
+<title>KEMIN · Panel</title>
+<meta name="theme-color" content="#07090d" />
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,${encodeURIComponent(`<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0%' stop-color='#1d4ed8'/><stop offset='55%' stop-color='#22d3ee'/><stop offset='100%' stop-color='#a5f3fc'/></linearGradient></defs><rect width='64' height='64' rx='14' fill='#07090d'/><rect x='2' y='2' width='60' height='60' rx='12' fill='url(#g)' opacity='0.95'/><text x='32' y='44' text-anchor='middle' font-family='Georgia,serif' font-style='italic' font-weight='700' font-size='34' fill='#07090d' letter-spacing='-2'>KF</text><path d='M 14 53 Q 32 58 50 53' stroke='#07090d' stroke-width='1.6' fill='none' stroke-linecap='round'/></svg>`)}" />
+<link rel="apple-touch-icon" href="data:image/svg+xml;utf8,${encodeURIComponent(`<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0%' stop-color='#1d4ed8'/><stop offset='55%' stop-color='#22d3ee'/><stop offset='100%' stop-color='#a5f3fc'/></linearGradient></defs><rect width='64' height='64' rx='14' fill='#07090d'/><rect x='2' y='2' width='60' height='60' rx='12' fill='url(#g)'/><text x='32' y='44' text-anchor='middle' font-family='Georgia,serif' font-style='italic' font-weight='700' font-size='34' fill='#07090d' letter-spacing='-2'>KF</text></svg>`)}" />
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,600;0,700;0,800;1,700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
