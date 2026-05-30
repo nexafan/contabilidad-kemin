@@ -46,14 +46,17 @@ if [ -f "$APP_DIR/.env" ]; then
   set -a; . "$APP_DIR/.env"; set +a
 fi
 
-if [ "${B2_ENABLED:-false}" = "true" ] && command -v rclone >/dev/null 2>&1; then
+B2_ENABLED="${B2_ENABLED:-false}"
+B2_BUCKET="${B2_BUCKET:-}"
+
+if [ "$B2_ENABLED" = "true" ] && [ -n "$B2_BUCKET" ] && command -v rclone >/dev/null 2>&1; then
   echo "[$(date)] Sync to B2 bucket $B2_BUCKET …"
   # rclone debe estar configurado previamente con un remote llamado "b2-kemin"
   # (ver README sección "Backblaze B2")
   rclone sync "$BACKUP_DIR" "b2-kemin:$B2_BUCKET/" --transfers 4 --quiet || \
     echo "[$(date)] ERROR sync to B2"
 else
-  echo "[$(date)] B2 disabled or rclone missing, only local backup"
+  echo "[$(date)] B2 disabled, bucket vacío o rclone missing → solo backup local"
 fi
 
 echo "[$(date)] backup done"
