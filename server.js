@@ -568,6 +568,26 @@ function askAuth(res) {
 
 app.get('/api/health', (req, res) => res.json({ ok: true, ts: nowISO() }));
 
+// PWA manifest — permite "Add to Home Screen" como app nativa
+app.get('/manifest.json', (req, res) => {
+  const iconSvg = `<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0%' stop-color='#1d4ed8'/><stop offset='55%' stop-color='#22d3ee'/><stop offset='100%' stop-color='#a5f3fc'/></linearGradient></defs><rect width='64' height='64' rx='14' fill='url(#g)'/><text x='32' y='44' text-anchor='middle' font-family='Georgia,serif' font-style='italic' font-weight='700' font-size='34' fill='#07090d' letter-spacing='-2'>KF</text></svg>`;
+  res.set('Cache-Control', 'public, max-age=86400');
+  res.json({
+    name: 'KEMIN LLC · Panel',
+    short_name: 'KEMIN',
+    start_url: '/',
+    scope: '/',
+    display: 'standalone',
+    orientation: 'portrait',
+    background_color: '#07090d',
+    theme_color: '#07090d',
+    description: 'Panel de stock + contabilidad para reventa de tickets',
+    icons: [
+      { src: 'data:image/svg+xml;utf8,' + encodeURIComponent(iconSvg), sizes: 'any', type: 'image/svg+xml', purpose: 'any maskable' }
+    ]
+  });
+});
+
 // =============================================================================
 // API — STOCK
 // =============================================================================
@@ -950,9 +970,15 @@ function renderPage(ctx) {
   return `<!DOCTYPE html>
 <html lang="es"><head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
 <title>KEMIN · Panel</title>
 <meta name="theme-color" content="#07090d" />
+<link rel="manifest" href="/manifest.json" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="KEMIN" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="application-name" content="KEMIN" />
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,${encodeURIComponent(`<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0%' stop-color='#1d4ed8'/><stop offset='55%' stop-color='#22d3ee'/><stop offset='100%' stop-color='#a5f3fc'/></linearGradient></defs><rect width='64' height='64' rx='14' fill='#07090d'/><rect x='2' y='2' width='60' height='60' rx='12' fill='url(#g)' opacity='0.95'/><text x='32' y='44' text-anchor='middle' font-family='Georgia,serif' font-style='italic' font-weight='700' font-size='34' fill='#07090d' letter-spacing='-2'>KF</text><path d='M 14 53 Q 32 58 50 53' stroke='#07090d' stroke-width='1.6' fill='none' stroke-linecap='round'/></svg>`)}" />
 <link rel="apple-touch-icon" href="data:image/svg+xml;utf8,${encodeURIComponent(`<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0%' stop-color='#1d4ed8'/><stop offset='55%' stop-color='#22d3ee'/><stop offset='100%' stop-color='#a5f3fc'/></linearGradient></defs><rect width='64' height='64' rx='14' fill='#07090d'/><rect x='2' y='2' width='60' height='60' rx='12' fill='url(#g)'/><text x='32' y='44' text-anchor='middle' font-family='Georgia,serif' font-style='italic' font-weight='700' font-size='34' fill='#07090d' letter-spacing='-2'>KF</text></svg>`)}" />
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -1965,6 +1991,62 @@ tr:hover .row-menu { color: var(--text-dim); }
   .bar-val { text-align: left; }
   .modal-body { grid-template-columns: 1fr; }
   body { padding: 24px 18px 40px; }
+}
+@media (max-width: 720px) {
+  body { padding: 14px 12px 30px; padding-top: calc(14px + env(safe-area-inset-top)); }
+  header { flex-direction: column; align-items: flex-start; gap: 10px; margin-bottom: 18px; }
+  .header-right { align-items: flex-start; }
+  .logo-mark { width: 56px; height: 48px; }
+  .brand { font-size: 24px; }
+  .brand-sub { font-size: 10px; letter-spacing: 1.5px; }
+  .meta-info { font-size: 10px; }
+  .tabs { position: sticky; top: env(safe-area-inset-top, 0); z-index: 30; margin: -14px -12px 18px; padding: 8px;
+    border-radius: 0; border-left: 0; border-right: 0; backdrop-filter: blur(10px);
+    background: rgba(17,22,31,0.92); }
+  .tab { padding: 8px 12px; font-size: 12px; }
+  .section-title { font-size: 18px; }
+  .section-sub { font-size: 12px; margin-bottom: 14px; }
+  .kpi-grid { grid-template-columns: repeat(2, 1fr); gap: 8px; }
+  .kpi { padding: 12px; }
+  .kpi-label { font-size: 10px; letter-spacing: 0.8px; margin-bottom: 6px; }
+  .kpi-value { font-size: 19px; }
+  .kpi-delta { font-size: 10px; }
+  .treasury-hero { padding: 18px; }
+  .treasury-value { font-size: 32px; }
+  .toolbar { gap: 6px; }
+  .toolbar input, .toolbar select, .toolbar .btn { min-width: 0; flex: 1 1 auto; font-size: 12px; padding: 8px 10px; }
+  .toolbar .spacer { display: none; }
+  /* Hint visual de scroll en tablas */
+  .table-wrap { position: relative; -webkit-overflow-scrolling: touch; }
+  .table-wrap::after { content: '⇄'; position: absolute; top: 8px; right: 10px; font-size: 12px;
+    color: var(--text-mute); background: var(--surface-2); border: 1px solid var(--border);
+    padding: 2px 6px; border-radius: 4px; pointer-events: none; opacity: 0.7; }
+  th, td { padding: 8px 10px; font-size: 12px; }
+  th { font-size: 10px; }
+  .runner-block-header { padding: 14px; }
+  .runner-title h2 { font-size: 18px; }
+  .runner-stats { padding: 12px 14px; gap: 12px; }
+  .runner-stats > div { min-width: 70px; }
+  .runner-stats .v { font-size: 13px; }
+  .runner-stats .l { font-size: 9px; }
+  .runner-actions { width: 100%; justify-content: stretch; flex-wrap: wrap; }
+  .runner-actions .btn { flex: 1; }
+  .modal { max-height: 100vh; max-height: 100dvh; border-radius: 0; }
+  .modal-header { padding: 14px 18px; }
+  .modal-header h2 { font-size: 18px; }
+  .modal-body { padding: 18px; gap: 14px; }
+  .modal-drop { min-height: 220px; padding: 18px; }
+  .modal-drop .preview { height: 180px; }
+  .ocr-field-row { grid-template-columns: 1fr; gap: 10px; }
+  .modal-footer { flex-direction: column; align-items: stretch; gap: 12px; padding: 14px 18px; }
+  .modal-footer > div { display: flex; gap: 10px; }
+  .modal-footer .btn { flex: 1; }
+  .user-chip { font-size: 10px; padding: 4px 10px; }
+}
+@media (max-width: 420px) {
+  .kpi-grid { grid-template-columns: 1fr; }
+  .runner-stats > div { min-width: 60px; }
+  .tab-badge { display: none; }
 }
 `;
 
