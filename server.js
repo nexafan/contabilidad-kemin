@@ -12,7 +12,7 @@ import express from 'express';
 import multer from 'multer';
 import Database from 'better-sqlite3';
 import Anthropic from '@anthropic-ai/sdk';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { readFileSync, mkdirSync, existsSync, renameSync, statSync, unlinkSync } from 'node:fs';
 import { join, dirname, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -180,7 +180,8 @@ const Q = {
   finalizadosByPeriod: db.prepare(`
     SELECT * FROM stock
     WHERE status IN ('cobrado','lost')
-      AND (payout_date BETWEEN @from AND @to OR sold_date BETWEEN @from AND @to)
+      AND ((payout_date >= @from AND payout_date < @to)
+        OR (sold_date >= @from AND sold_date < @to))
     ORDER BY COALESCE(payout_date, sold_date) DESC
   `),
   eventCounts: db.prepare(`
@@ -551,13 +552,24 @@ const upload = multer({
   limits: { fileSize: 12 * 1024 * 1024 } // 12 MB
 });
 
-// Auth básica
+// Auth básica con timing-safe compare
+function safeStrEq(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  // timingSafeEqual exige misma longitud, así que igualamos buffers a la longitud máxima
+  const len = Math.max(bufA.length, bufB.length);
+  const padA = Buffer.alloc(len); bufA.copy(padA);
+  const padB = Buffer.alloc(len); bufB.copy(padB);
+  return timingSafeEqual(padA, padB) && bufA.length === bufB.length;
+}
 app.use((req, res, next) => {
-  if (req.path.startsWith('/api/health')) return next();
+  if (req.path.startsWith('/api/health') || req.path === '/manifest.json') return next();
   const auth = req.headers.authorization || '';
   if (!auth.startsWith('Basic ')) return askAuth(res);
   const [user, pass] = Buffer.from(auth.slice(6), 'base64').toString('utf8').split(':');
-  if (!PANEL_USERS[user] || PANEL_USERS[user] !== pass) return askAuth(res);
+  const expected = PANEL_USERS[user];
+  if (!expected || !safeStrEq(expected, pass || '')) return askAuth(res);
   req.user = user;
   next();
 });
@@ -647,15 +659,22 @@ app.delete('/api/stock/:id', (req, res) => {
   res.json({ ok: r.changes > 0 });
 });
 
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+function validDateOrNull(v) {
+  if (!v) return null;
+  if (!ISO_DATE_RE.test(v)) throw new Error('Fecha inválida (formato YYYY-MM-DD): ' + v);
+  return v;
+}
 function buildStockRow(input, user, isUpdate = false) {
   const evento = (input.evento || '').trim();
   if (!evento) throw new Error('evento requerido');
+  if (input.retailer && !RETAILERS.includes(input.retailer)) throw new Error('Retailer no válido: ' + input.retailer);
   const now = nowISO();
   const partial = {
     id: input.id || randomUUID(),
     evento,
-    bought_date: input.bought_date || today(),
-    event_date: input.event_date || null,
+    bought_date: validDateOrNull(input.bought_date) || today(),
+    event_date: validDateOrNull(input.event_date),
     retailer: input.retailer || null,
     cuenta: input.cuenta || null,
     selling_platform: input.selling_platform || null,
@@ -667,8 +686,8 @@ function buildStockRow(input, user, isUpdate = false) {
     listed_at: numOrNull(input.listed_at),
     sold_at: numOrNull(input.sold_at),
     payout_amount: numOrNull(input.payout_amount),
-    sold_date: input.sold_date || null,
-    payout_date: input.payout_date || null,
+    sold_date: validDateOrNull(input.sold_date),
+    payout_date: validDateOrNull(input.payout_date),
     fulfilled: input.fulfilled ? 1 : 0,
     origin: input.origin || 'manual',
     ocr_log_id: input.ocr_log_id || null,
@@ -749,6 +768,8 @@ function buildExpenseRow(input) {
     total_pagado: null
   };
   if (modo === 'fijo') {
+    // Si no es recurrente, forzamos 1 pago (evita typos tipo base_meses=12 en gasto puntual)
+    if (!r.recurrente) r.base_meses = 1;
     r.total_pagado = (r.precio_mes || 0) * (r.base_meses || 1);
   } else {
     // % sobre profit: si bot_origin_tag presente, calcular profit de tickets con ese origin
@@ -854,6 +875,8 @@ app.patch('/api/runners/:tag', (req, res) => {
 app.delete('/api/runners/:tag', (req, res) => {
   const stock = Q.stockByOrigin.all(req.params.tag);
   if (stock.length) return res.status(400).json({ error: 'No se puede borrar: tiene ' + stock.length + ' tickets. Cambia status a closed.' });
+  const movs = Q.capByRunner.all(req.params.tag);
+  if (movs.length) return res.status(400).json({ error: `No se puede borrar: tiene ${movs.length} movimientos de capital (allocations/devoluciones/comisiones). Cambia status a closed para conservar el histórico.` });
   const r = Q.deleteRunner.run(req.params.tag);
   res.json({ ok: r.changes > 0 });
 });
@@ -917,13 +940,16 @@ app.post('/api/ocr', upload.single('image'), async (req, res) => {
 app.get('/', (req, res) => {
   const treasury = calcTreasury();
   const stockAll = Q.allStock.all().map(applyStatusAuto);
+  // "Activos" incluye sold (pending payout) porque sigue siendo capital en juego
   const stockActive = stockAll.filter(r => r.status !== 'cobrado' && r.status !== 'lost');
   const expenses = Q.allExpenses.all();
   const eventTabs = getDynamicEventTabs();
   const finalizadosPeriod = req.query.fin_period || today().slice(0, 7);
+  const [fy, fm] = finalizadosPeriod.split('-').map(Number);
   const finalizadosFrom = finalizadosPeriod + '-01';
-  const finalizadosTo = finalizadosPeriod + '-31';
-  const finalizados = Q.finalizadosByPeriod.all({ from: finalizadosFrom, to: finalizadosTo }).map(applyStatusAuto);
+  // Primer día del mes siguiente (correctamente incluso para febrero, abril, junio, etc.)
+  const nm = fm === 12 ? `${fy + 1}-01-01` : `${fy}-${String(fm + 1).padStart(2, '0')}-01`;
+  const finalizados = Q.finalizadosByPeriod.all({ from: finalizadosFrom, to: nm }).map(applyStatusAuto);
 
   const dashFrom = today().slice(0, 4) + '-01-01';
   const dashTo = today();
@@ -939,11 +965,15 @@ app.get('/', (req, res) => {
   }));
 });
 
-// Servir capturas con auth ya aplicada
+// Servir capturas con auth ya aplicada — protección anti path-traversal
 app.get('/uploads/*', (req, res) => {
-  const rel = req.params[0];
-  if (rel.includes('..')) return res.status(400).end();
+  let rel = req.params[0] || '';
+  try { rel = decodeURIComponent(rel); } catch { return res.status(400).end(); }
+  if (rel.includes('..') || rel.includes('\0') || rel.startsWith('/')) return res.status(400).end();
   const fp = join(UPLOADS_DIR, rel);
+  // Asegurar que el path resuelto sigue dentro de UPLOADS_DIR
+  const realBase = join(process.cwd(), UPLOADS_DIR.replace(/^\.\//, ''));
+  if (!fp.startsWith(UPLOADS_DIR) && !fp.startsWith(realBase)) return res.status(400).end();
   if (!existsSync(fp)) return res.status(404).end();
   res.sendFile(fp);
 });
@@ -1104,6 +1134,14 @@ function renderTesoreriaPage(t) {
   </section>`;
 }
 
+function emptyStateInTable(title, sub, icon = '∅') {
+  return `<div class="empty-inner">
+    <div class="empty-icon">${icon}</div>
+    <div class="empty-title">${esc(title)}</div>
+    <div class="empty-sub">${esc(sub)}</div>
+  </div>`;
+}
+
 function bar(dot, label, amount, pct, colorVar) {
   return `
   <div class="bar-row">
@@ -1147,6 +1185,10 @@ function renderStockPage(rowsHtml, count, constants) {
           <option value="cobrado">Cobrado</option>
           <option value="lost">Lost</option>
         </select>
+        <select id="stock-filter-origin">
+          <option value="">Origen: Todos</option>
+          <option value="manual">Compra propia</option>
+        </select>
         <div class="spacer"></div>
         <button class="btn btn-ocr" onclick="openOcrModal()">📸 Subir captura</button>
         <button class="btn" onclick="openEditModal('stock', null)">＋ Nuevo ticket</button>
@@ -1157,6 +1199,7 @@ function renderStockPage(rowsHtml, count, constants) {
           <thead>
             <tr>
               <th>Evento</th>
+              <th>Origen</th>
               <th>Bought</th>
               <th>Event</th>
               <th>Retailer</th>
@@ -1172,7 +1215,7 @@ function renderStockPage(rowsHtml, count, constants) {
               <th class="row-actions">⋯</th>
             </tr>
           </thead>
-          <tbody>${rowsHtml || `<tr><td colspan="14" style="text-align:center;color:var(--text-mute);padding:32px;">Sin tickets aún. Click <strong>＋ Nuevo ticket</strong> o <strong>📸 Subir captura</strong>.</td></tr>`}</tbody>
+          <tbody>${rowsHtml || `<tr><td colspan="15">${emptyStateInTable('Sin tickets aún', 'Click ＋ Nuevo ticket o 📸 Subir captura para empezar.', '🎟')}</td></tr>`}</tbody>
         </table>
       </div>
     </div>
@@ -1187,9 +1230,14 @@ function renderStockRow(r) {
   const seccion = [r.seccion, r.fila, r.asiento].filter(Boolean).join(' · ') || '—';
   const rtag = retailerTag(r.retailer);
   const statusPill = statusToPill(r.status);
+  const origin = r.origin || 'manual';
+  const originPill = origin === 'manual'
+    ? '<span class="pill pill-mute">propia</span>'
+    : `<span class="pill pill-violet" title="Runner: ${escAttr(origin)}">🏃 ${esc(origin)}</span>`;
   return `
-  <tr data-id="${escAttr(r.id)}" data-status="${escAttr(r.status)}" data-evento="${escAttr(r.evento)}" data-retailer="${escAttr(r.retailer || '')}">
+  <tr data-id="${escAttr(r.id)}" data-status="${escAttr(r.status)}" data-evento="${escAttr(r.evento)}" data-retailer="${escAttr(r.retailer || '')}" data-origin="${escAttr(origin)}">
     <td><strong>${esc(r.evento)}</strong></td>
+    <td>${originPill}</td>
     <td>${fmtDateShort(r.bought_date)}</td>
     <td>${fmtDateShort(r.event_date)}</td>
     <td>${rtag}</td>
@@ -1265,7 +1313,7 @@ function renderExpensesPage(rowsHtml, expenses) {
               <th class="row-actions">⋯</th>
             </tr>
           </thead>
-          <tbody>${rowsHtml || `<tr><td colspan="8" style="text-align:center;color:var(--text-mute);padding:32px;">Sin gastos aún. Click <strong>＋ Nuevo gasto</strong>.</td></tr>`}</tbody>
+          <tbody>${rowsHtml || `<tr><td colspan="8">${emptyStateInTable('Sin gastos aún', 'Click ＋ Nuevo gasto para añadir el primero.', '🧾')}</td></tr>`}</tbody>
         </table>
       </div>
     </div>
@@ -1399,7 +1447,7 @@ function renderFinalizadosPage(rowsHtml, finalizados, period) {
               <th class="num">Profit</th><th class="num">ROI</th><th class="row-actions">⋯</th>
             </tr>
           </thead>
-          <tbody>${rowsHtml || `<tr><td colspan="10" style="text-align:center;color:var(--text-mute);padding:32px;">Sin tickets cerrados en este periodo.</td></tr>`}</tbody>
+          <tbody>${rowsHtml || `<tr><td colspan="10">${emptyStateInTable('Sin operaciones cerradas en este periodo', 'Cambia el mes arriba para ver otro rango.', '📊')}</td></tr>`}</tbody>
         </table>
       </div>
     </div>
@@ -1477,7 +1525,7 @@ function renderRunnersPage(runners) {
       </div>
 
       ${runners.length === 0
-        ? `<div class="empty-state">Sin runners aún. Click <strong>＋ Nuevo runner</strong> para añadir el primero.</div>`
+        ? `<div class="empty-state">${emptyStateInTable('Sin runners aún', 'Crea uno y le asignas capital de tus tarjetas Slash. Cobra % sobre profit cuando vendes lo que él compre.', '🏃')}</div>`
         : runners.map(renderRunnerBlock).join('')
       }
     </div>
@@ -1492,7 +1540,12 @@ function renderRunnerBlock(r) {
   }[r.status] || '';
   const profitColor = r.profitGenerado >= 0 ? 'var(--green)' : 'var(--red)';
   const pendColor = r.comisionPendiente > 0 ? 'var(--amber)' : 'var(--text-mute)';
-  const ticketRows = r.tickets.length ? r.tickets.map(renderStockRow).join('') : '';
+  // Limitar a 30 tickets en vista (link a Stock para ver todos)
+  const MAX_PER_RUNNER = 30;
+  const visible = r.tickets.slice(0, MAX_PER_RUNNER);
+  const overflow = r.tickets.length - visible.length;
+  const ticketRows = visible.map(renderStockRow).join('') +
+    (overflow > 0 ? `<tr><td colspan="15" style="text-align:center;padding:14px;background:var(--bg-2);"><a href="javascript:gotoStockFiltered('${escAttr(r.tag)}')" style="color:var(--cyan);text-decoration:none;font-weight:600;">+${overflow} más → ver todos en Stock con filtro ${esc(r.tag)}</a></td></tr>` : '');
   const tag = escAttr(r.tag);
 
   return `
@@ -1528,13 +1581,13 @@ function renderRunnerBlock(r) {
       <table>
         <thead>
           <tr>
-            <th>Evento</th><th>Bought</th><th>Event</th><th>Retailer</th><th>Cuenta</th>
+            <th>Evento</th><th>Origen</th><th>Bought</th><th>Event</th><th>Retailer</th><th>Cuenta</th>
             <th>Selling</th><th>Sección / Fila / Asiento</th>
             <th class="num">Retail</th><th class="num">Listed</th><th class="num">Sold At</th>
             <th class="num">Payout</th><th class="num">Profit</th><th>Estado</th><th class="row-actions">⋯</th>
           </tr>
         </thead>
-        <tbody>${ticketRows || `<tr><td colspan="14" style="text-align:center;color:var(--text-mute);padding:32px;">Sin tickets de ${esc(r.name)} aún. Click <strong>📸 Subir captura</strong> o <strong>＋ Nuevo ticket</strong>.</td></tr>`}</tbody>
+        <tbody>${ticketRows || `<tr><td colspan="15">${emptyStateInTable(`Sin tickets de ${r.name} aún`, 'Click 📸 Subir captura o ＋ Nuevo ticket arriba.', '🎟')}</td></tr>`}</tbody>
       </table>
     </div>
   </div>`;
@@ -1772,6 +1825,10 @@ body::before {
 .stagger > *:nth-child(4) { animation-delay: 0.16s; }
 .stagger > *:nth-child(5) { animation-delay: 0.20s; }
 .stagger > *:nth-child(6) { animation-delay: 0.24s; }
+.stagger > *:nth-child(7) { animation-delay: 0.28s; }
+.stagger > *:nth-child(8) { animation-delay: 0.32s; }
+.stagger > *:nth-child(9) { animation-delay: 0.36s; }
+.stagger > *:nth-child(n+10) { animation-delay: 0.4s; }
 header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 30px; animation: fadeUp 0.5s both; }
 .brand-block { display: flex; align-items: center; gap: 16px; }
 .logo-mark { width: 70px; height: 60px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; }
@@ -1959,6 +2016,68 @@ tr:hover .row-menu { color: var(--text-dim); }
 .d-violet { background: var(--violet); }
 .empty-state { background: var(--surface); border: 1px dashed var(--border); border-radius: 14px;
   padding: 40px; text-align: center; color: var(--text-mute); }
+.empty-inner { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 36px 16px; }
+.empty-icon { font-size: 42px; opacity: 0.35; margin-bottom: 4px; filter: grayscale(0.3); }
+.empty-title { color: var(--text-dim); font-size: 14px; font-weight: 600; }
+.empty-sub { color: var(--text-mute); font-size: 12px; max-width: 380px; }
+
+/* Toasts */
+#toast-container { position: fixed; bottom: 24px; right: 24px; z-index: 200; display: flex; flex-direction: column; gap: 10px; pointer-events: none; }
+.toast { background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+  padding: 12px 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); color: var(--text);
+  font-size: 13px; font-weight: 500; display: flex; align-items: center; gap: 10px;
+  min-width: 220px; max-width: 380px; opacity: 0; transform: translateX(20px) scale(0.95);
+  transition: opacity 0.25s, transform 0.3s cubic-bezier(0.16, 1, 0.3, 1); pointer-events: auto; }
+.toast.show { opacity: 1; transform: none; }
+.toast-icon { width: 24px; height: 24px; border-radius: 50%; display: inline-flex;
+  align-items: center; justify-content: center; font-weight: 700; flex-shrink: 0; font-size: 12px; }
+.toast-success { border-color: rgba(16,185,129,0.4); }
+.toast-success .toast-icon { background: rgba(16,185,129,0.15); color: var(--green); }
+.toast-success::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--green); border-radius: 12px 0 0 12px; }
+.toast-error { border-color: rgba(239,68,68,0.45); }
+.toast-error .toast-icon { background: rgba(239,68,68,0.18); color: var(--red); }
+.toast-error::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--red); border-radius: 12px 0 0 12px; }
+.toast-info .toast-icon { background: rgba(34,211,238,0.15); color: var(--cyan); }
+.toast { position: relative; padding-left: 18px; }
+@media (max-width: 720px) {
+  #toast-container { bottom: 16px; left: 12px; right: 12px; }
+  .toast { min-width: 0; max-width: none; }
+}
+
+/* Glow más vivo en KPIs accent */
+.kpi.accent-green::after { background: linear-gradient(90deg, transparent, var(--green), transparent); opacity: 0.5; }
+.kpi.accent-red::after { background: linear-gradient(90deg, transparent, var(--red), transparent); opacity: 0.5; }
+.kpi.accent-amber::after { background: linear-gradient(90deg, transparent, var(--amber), transparent); opacity: 0.5; }
+.kpi.accent-violet::after { background: linear-gradient(90deg, transparent, var(--violet), transparent); opacity: 0.5; }
+.kpi.clickable:hover { box-shadow: 0 8px 28px rgba(34,211,238,0.18); }
+
+/* Sutil text-shadow en treasury value */
+.treasury-value { text-shadow: 0 0 30px rgba(34,211,238,0.25); }
+
+/* Pulse sutil en btn OCR para llamar atención */
+@keyframes ocrPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(139, 92, 246, 0); }
+  50% { box-shadow: 0 0 0 6px rgba(139, 92, 246, 0.15); }
+}
+.btn-ocr { animation: ocrPulse 3.5s ease-in-out infinite; }
+.btn-ocr:hover { animation: none; }
+
+/* Pills transición */
+.pill { transition: background 0.18s, transform 0.12s; }
+.pill:hover { transform: translateY(-1px); }
+
+/* Gradient fade en tabs móvil (indicador de scroll horizontal) */
+@media (max-width: 720px) {
+  .tabs { position: relative; }
+  .tabs::after { content: ''; position: absolute; right: 0; top: 0; bottom: 0; width: 24px;
+    background: linear-gradient(90deg, transparent, rgba(17,22,31,0.95)); pointer-events: none; border-radius: 0 14px 14px 0; }
+}
+
+/* Auto-focus visible feedback */
+.modal input:focus, .modal select:focus { box-shadow: 0 0 0 3px rgba(34,211,238,0.15); }
+
+/* Origin pill violet */
+.pill-violet { background: rgba(139,92,246,0.18); color: #c4b5fd; border: 1px solid rgba(139,92,246,0.35); }
 
 .runner-block { background: var(--surface); border: 1px solid var(--border); border-radius: 16px;
   margin-bottom: 22px; overflow: hidden; position: relative; }
@@ -2084,6 +2203,51 @@ window.softReload = function() {
   // El hash ya está en URL, location.reload() lo conserva
   location.reload();
 };
+
+// Toasts
+(function ensureToastContainer() {
+  if (document.getElementById('toast-container')) return;
+  const c = document.createElement('div');
+  c.id = 'toast-container';
+  document.body.appendChild(c);
+})();
+window.toast = function(msg, type = 'success', ms = 3000) {
+  const c = document.getElementById('toast-container');
+  if (!c) return;
+  const t = document.createElement('div');
+  t.className = 'toast toast-' + type;
+  const icon = type === 'success' ? '✓' : type === 'error' ? '✗' : 'ℹ';
+  t.innerHTML = '<span class="toast-icon">' + icon + '</span><span>' + msg + '</span>';
+  c.appendChild(t);
+  setTimeout(() => t.classList.add('show'), 10);
+  setTimeout(() => { t.classList.remove('show'); setTimeout(() => t.remove(), 300); }, ms);
+};
+
+// Mostrar toast tras softReload — guardado en sessionStorage
+(function flushToasts() {
+  const queued = sessionStorage.getItem('kemin_toast');
+  if (queued) {
+    sessionStorage.removeItem('kemin_toast');
+    try { const { msg, type } = JSON.parse(queued); toast(msg, type); } catch {}
+  }
+})();
+window.queueToast = function(msg, type) {
+  sessionStorage.setItem('kemin_toast', JSON.stringify({msg, type}));
+};
+
+// Wrapper: disable button durante request + maneja errores con toast
+async function submitWithButton(btn, fn) {
+  if (!btn) return await fn();
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '… guardando';
+  try {
+    return await fn();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = original;
+  }
+}
 // Collapsibles
 document.querySelectorAll('.section-title.collapsible').forEach(t => {
   t.addEventListener('click', () => t.classList.toggle('collapsed'));
@@ -2109,27 +2273,49 @@ function applyStockFilters() {
   const ev = document.getElementById('stock-filter-evento')?.value || '';
   const rt = document.getElementById('stock-filter-retailer')?.value || '';
   const st = document.getElementById('stock-filter-status')?.value || '';
+  const og = document.getElementById('stock-filter-origin')?.value || '';
   document.querySelectorAll('#stock-table tbody tr[data-id]').forEach(tr => {
     const txt = tr.textContent.toLowerCase();
     const okQ = !q || txt.includes(q);
     const okEv = !ev || tr.dataset.evento === ev;
     const okRt = !rt || tr.dataset.retailer === rt;
     const okSt = !st || tr.dataset.status === st;
-    tr.style.display = (okQ && okEv && okRt && okSt) ? '' : 'none';
+    const okOg = !og || tr.dataset.origin === og;
+    tr.style.display = (okQ && okEv && okRt && okSt && okOg) ? '' : 'none';
   });
 }
-['stock-search','stock-filter-evento','stock-filter-retailer','stock-filter-status']
+['stock-search','stock-filter-evento','stock-filter-retailer','stock-filter-status','stock-filter-origin']
   .forEach(id => document.getElementById(id)?.addEventListener('input', applyStockFilters));
-// Populate event filter dropdown
+// Populate event + origin filter dropdowns
 (function(){
-  const sel = document.getElementById('stock-filter-evento');
-  if (!sel) return;
-  const eventos = new Set();
-  document.querySelectorAll('#stock-table tbody tr[data-evento]').forEach(tr => eventos.add(tr.dataset.evento));
-  Array.from(eventos).sort().forEach(e => {
-    const o = document.createElement('option'); o.value = e; o.textContent = e; sel.appendChild(o);
-  });
+  const evSel = document.getElementById('stock-filter-evento');
+  if (evSel) {
+    const eventos = new Set();
+    document.querySelectorAll('#stock-table tbody tr[data-evento]').forEach(tr => eventos.add(tr.dataset.evento));
+    Array.from(eventos).sort().forEach(e => {
+      const o = document.createElement('option'); o.value = e; o.textContent = e; evSel.appendChild(o);
+    });
+  }
+  const ogSel = document.getElementById('stock-filter-origin');
+  if (ogSel) {
+    const origins = new Set();
+    document.querySelectorAll('#stock-table tbody tr[data-origin]').forEach(tr => {
+      if (tr.dataset.origin && tr.dataset.origin !== 'manual') origins.add(tr.dataset.origin);
+    });
+    Array.from(origins).sort().forEach(o => {
+      const opt = document.createElement('option'); opt.value = o; opt.textContent = '🏃 ' + o; ogSel.appendChild(opt);
+    });
+  }
 })();
+// Saltar a Stock con filtro de origen pre-aplicado
+window.gotoStockFiltered = function(originTag) {
+  document.querySelector('.tab[data-tab="stock"]').click();
+  setTimeout(() => {
+    const sel = document.getElementById('stock-filter-origin');
+    if (sel) { sel.value = originTag; sel.dispatchEvent(new Event('input')); }
+  }, 50);
+};
+
 // Runners filtros: busca por nombre/tag en bloques de runner
 function applyRunnerFilters() {
   const q = (document.getElementById('runner-search')?.value || '').toLowerCase();
@@ -2180,25 +2366,37 @@ window.rowMenu = function(e, kind, id) {
   }, 0);
 };
 window.quickPatch = async function(kind, id, body) {
-  if (Object.values(body).some(v => v === null)) return; // user cancelled prompt
+  // Validación: si algún prompt() devolvió null o vacío para campos numéricos requeridos
+  for (const k of Object.keys(body)) {
+    if (body[k] === null) return; // user canceló prompt
+    if (['listed_at','sold_at','payout_amount','price_retail'].includes(k)) {
+      const n = parseFloat(body[k]);
+      if (isNaN(n) || n < 0) { toast('Importe inválido: ' + body[k], 'error'); return; }
+      body[k] = n;
+    }
+  }
   const url = kind === 'stock' ? '/api/stock/' + id : '/api/expenses/' + id;
   const r = await fetch(url, { method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
-  if (r.ok) softReload(); else alert('Error: ' + (await r.text()));
+  if (r.ok) { queueToast('Actualizado', 'success'); softReload(); }
+  else toast('Error: ' + (await r.text()), 'error');
 };
 window.deleteRow = async function(kind, id) {
   if (!confirm('¿Eliminar definitivamente?')) return;
   const url = kind === 'stock' ? '/api/stock/' + id : '/api/expenses/' + id;
   const r = await fetch(url, { method: 'DELETE' });
-  if (r.ok) softReload(); else alert('Error');
+  if (r.ok) { queueToast('Eliminado', 'success'); softReload(); }
+  else toast('Error al eliminar', 'error');
 };
 window.quickPatchRunner = async function(tag, body) {
   const r = await fetch('/api/runners/' + tag, { method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
-  if (r.ok) softReload(); else alert('Error: ' + (await r.text()));
+  if (r.ok) { queueToast('Runner actualizado', 'success'); softReload(); }
+  else toast('Error: ' + (await r.text()), 'error');
 };
 window.deleteRunner = async function(tag) {
-  if (!confirm('¿Eliminar runner ' + tag + '?')) return;
+  if (!confirm('¿Eliminar runner ' + tag + '?\\n\\nNo se puede deshacer.')) return;
   const r = await fetch('/api/runners/' + tag, { method: 'DELETE' });
-  if (r.ok) softReload(); else alert('Error: ' + (await r.text()));
+  if (r.ok) { queueToast('Runner eliminado', 'success'); softReload(); }
+  else toast('Error: ' + (await r.text()), 'error');
 };
 window.duplicateRow = async function(kind, id) {
   const url = kind === 'stock' ? '/api/stock' : '/api/expenses';
@@ -2210,7 +2408,16 @@ window.duplicateRow = async function(kind, id) {
   if (r.ok) softReload();
 };
 // Modals
-window.openModal = id => document.getElementById(id)?.classList.add('open');
+window.openModal = id => {
+  const m = document.getElementById(id);
+  if (!m) return;
+  m.classList.add('open');
+  // Auto-focus al primer input visible (saltando hidden)
+  setTimeout(() => {
+    const el = m.querySelector('input:not([type="hidden"]):not([readonly]), textarea, select');
+    if (el && typeof el.focus === 'function') el.focus();
+  }, 80);
+};
 window.closeModal = id => document.getElementById(id)?.classList.remove('open');
 window.openOcrModal = async function(prefillRunnerTag) {
   document.getElementById('ocr-status').textContent = 'Sube una captura para empezar.';
@@ -2303,13 +2510,18 @@ window.confirmOcr = async function() {
   const form = document.getElementById('ocr-form');
   const fd = new FormData(form);
   const obj = Object.fromEntries(fd);
+  if (!obj.evento || !obj.evento.trim()) { toast('Falta el nombre del evento', 'error'); return; }
   const n = parseInt(obj.n_tickets || 1);
+  if (isNaN(n) || n < 1) { toast('N tickets inválido', 'error'); return; }
   delete obj.n_tickets;
   const items = Array.from({length: n}, () => ({...obj}));
   const body = { items, ocr_log_id: window.__ocr?.ocr_log_id };
-  const r = await fetch('/api/stock/bulk', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
-  if (r.ok) { closeModal('ocr-modal'); softReload(); }
-  else alert('Error: ' + (await r.text()));
+  const btn = document.getElementById('ocr-confirm');
+  await submitWithButton(btn, async () => {
+    const r = await fetch('/api/stock/bulk', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    if (r.ok) { queueToast(n + ' ticket' + (n>1?'s':'') + ' creado' + (n>1?'s':''), 'success'); closeModal('ocr-modal'); softReload(); }
+    else toast('Error: ' + (await r.text()), 'error');
+  });
 };
 // Edit modal — admite prefill (ej. {origin: 'joey'} para crear ticket de un runner)
 window.openEditModal = async function(kind, id, prefill = {}) {
@@ -2352,9 +2564,12 @@ window.saveEdit = async function(ev) {
   const base = kind === 'stock' ? '/api/stock' : '/api/expenses';
   const url = id ? base + '/' + id : base;
   const method = id ? 'PATCH' : 'POST';
-  const r = await fetch(url, { method, headers: {'Content-Type':'application/json'}, body: JSON.stringify(obj) });
-  if (r.ok) { closeModal('edit-modal'); softReload(); }
-  else alert('Error: ' + (await r.text()));
+  const btn = form.querySelector('button[type="submit"]');
+  await submitWithButton(btn, async () => {
+    const r = await fetch(url, { method, headers: {'Content-Type':'application/json'}, body: JSON.stringify(obj) });
+    if (r.ok) { queueToast(id ? 'Guardado' : 'Creado', 'success'); closeModal('edit-modal'); softReload(); }
+    else toast('Error: ' + (await r.text()), 'error');
+  });
   return false;
 };
 // Capital modal — soporta deposit, withdrawal, allocation, return, commission
@@ -2389,9 +2604,15 @@ window.saveCapital = async function(ev) {
   const fd = new FormData(form);
   const body = Object.fromEntries(fd);
   if (!body.runner_tag) delete body.runner_tag;
-  const r = await fetch('/api/capital', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
-  if (r.ok) { closeModal('capital-modal'); softReload(); }
-  else alert('Error: ' + (await r.text()));
+  const amt = parseFloat(body.amount);
+  if (isNaN(amt) || amt <= 0) { toast('Cantidad inválida', 'error'); return false; }
+  if (amt > 100000 && !confirm('¿Cantidad confirmada? ' + amt.toLocaleString() + ' USD parece grande.')) return false;
+  const btn = form.querySelector('button[type="submit"]');
+  await submitWithButton(btn, async () => {
+    const r = await fetch('/api/capital', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    if (r.ok) { queueToast('Movimiento registrado', 'success'); closeModal('capital-modal'); softReload(); }
+    else toast('Error: ' + (await r.text()), 'error');
+  });
   return false;
 };
 
@@ -2432,14 +2653,17 @@ window.saveRunner = async function(ev) {
   const originalTag = body._originalTag; delete body._originalTag;
   // Convertir % humano (ej. 40) → decimal (0.40) para el backend
   const pctHuman = parseFloat(body.commission_pct_display);
-  if (isNaN(pctHuman) || pctHuman < 0 || pctHuman > 100) { alert('Comisión % debe ser entre 0 y 100'); return false; }
+  if (isNaN(pctHuman) || pctHuman < 0 || pctHuman > 100) { toast('Comisión % debe ser entre 0 y 100', 'error'); return false; }
   body.commission_pct = pctHuman / 100;
   delete body.commission_pct_display;
   const url = originalTag ? '/api/runners/' + originalTag : '/api/runners';
   const method = originalTag ? 'PATCH' : 'POST';
-  const r = await fetch(url, { method, headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
-  if (r.ok) { closeModal('runner-modal'); softReload(); }
-  else alert('Error: ' + (await r.text()));
+  const btn = form.querySelector('button[type="submit"]');
+  await submitWithButton(btn, async () => {
+    const r = await fetch(url, { method, headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    if (r.ok) { queueToast(originalTag ? 'Runner actualizado' : 'Runner creado', 'success'); closeModal('runner-modal'); softReload(); }
+    else toast('Error: ' + (await r.text()), 'error');
+  });
   return false;
 };
 // Period change
@@ -2466,6 +2690,10 @@ window.exportCSV = function(kind) {
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') document.querySelectorAll('.modal-overlay.open').forEach(m => m.classList.remove('open'));
 });
+// Scroll/resize cierra cualquier row-menu dropdown abierto (evita off-place)
+['scroll','resize'].forEach(ev => window.addEventListener(ev, () => {
+  document.querySelectorAll('.row-menu-dropdown').forEach(d => d.remove());
+}, { passive: true }));
 document.querySelectorAll('.modal-overlay').forEach(m => {
   m.addEventListener('click', e => { if (e.target === m) m.classList.remove('open'); });
 });
