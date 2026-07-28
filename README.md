@@ -151,6 +151,20 @@ Sin esto, si el VPS muere pierdes todo el histórico de tickets. Setup en 5 min:
 
 El cron diario hará `rclone sync` automáticamente. Coste real: < $1/mes para nuestro volumen.
 
+**Cómo está organizado el bucket** (importante si alguna vez hay que restaurar):
+
+```
+kemin-backups/
+├── kemin/       ← copias de KEMIN (esto es lo nuestro)
+├── nexafans/    ← copias de NexaFans: NO TOCAR
+└── *.gz         ← 64 ficheros sueltos del 27-jun al 28-jul (ver abajo)
+```
+
+Los ficheros sueltos de la raíz son de cuando el backup subía ahí por error. Se dejaron
+a propósito: 62 están duplicados en `kemin/` y 2 son la única copia que queda de esas
+fechas, así que borrarlos no aporta nada (23 MB) y sí puede quitar historial. **Para
+restaurar, usa siempre `kemin/`**, que es la carpeta viva.
+
 ---
 
 ## Cómo funciona el OCR
