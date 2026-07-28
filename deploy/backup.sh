@@ -49,11 +49,18 @@ fi
 B2_ENABLED="${B2_ENABLED:-false}"
 B2_BUCKET="${B2_BUCKET:-}"
 
+# OJO — el destino DEBE ser una subcarpeta propia, nunca la raíz del bucket. `rclone sync`
+# es un ESPEJO: apuntando a la raíz borra todo lo que no esté en $BACKUP_DIR, y el bucket
+# lo comparte el backup de NexaFans (subcarpeta nexafans/). Apuntar aquí a la raíz dejó a
+# NexaFans 6 días sin copia offsite (28-jul-2026): sus 77 ficheros se subían a las 04:00 y
+# este sync los borraba a las 04:30, mientras su log seguía diciendo "offsite OK".
 if [ "$B2_ENABLED" = "true" ] && [ -n "$B2_BUCKET" ] && command -v rclone >/dev/null 2>&1; then
   echo "[$(date)] Sync to B2 bucket $B2_BUCKET …"
   # rclone debe estar configurado previamente con un remote llamado "b2-kemin"
   # (ver README sección "Backblaze B2")
-  rclone sync "$BACKUP_DIR" "b2-kemin:$B2_BUCKET/" --transfers 4 --quiet || \
+  # --max-delete: segundo cinturón. Si un día $BACKUP_DIR aparece vacío o medio vacío,
+  # el sync aborta en vez de replicar el vacío contra la copia offsite.
+  rclone sync "$BACKUP_DIR" "b2-kemin:$B2_BUCKET/" --transfers 4 --max-delete 10 --quiet || \
     echo "[$(date)] ERROR sync to B2"
 else
   echo "[$(date)] B2 disabled, bucket vacío o rclone missing → solo backup local"
