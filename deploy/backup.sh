@@ -54,6 +54,23 @@ B2_BUCKET="${B2_BUCKET:-}"
 # lo comparte el backup de NexaFans (subcarpeta nexafans/). Apuntar aquí a la raíz dejó a
 # NexaFans 6 días sin copia offsite (28-jul-2026): sus 77 ficheros se subían a las 04:00 y
 # este sync los borraba a las 04:30, mientras su log seguía diciendo "offsite OK".
+# CANDADO: sin subcarpeta no se sincroniza. Los comentarios y el README se ignoran; esto
+# no. Si $B2_BUCKET no lleva una '/' con algo detrás, el destino sería la raíz del bucket
+# y este sync se llevaría por delante la copia de NexaFans. Antes de fallar en silencio,
+# mejor no subir nada y dejarlo dicho: el backup LOCAL sigue estando.
+case "$B2_BUCKET" in
+  */?*) : ;;   # bucket/subcarpeta → correcto
+  *)
+    if [ "$B2_ENABLED" = "true" ] && [ -n "$B2_BUCKET" ]; then
+      echo "[$(date)] ERROR: B2_BUCKET='$B2_BUCKET' apunta a la RAIZ del bucket."
+      echo "[$(date)]        Ese bucket lo comparte el backup de NexaFans y un sync a la raiz"
+      echo "[$(date)]        BORRARIA sus copias. Pon B2_BUCKET=$B2_BUCKET/kemin en el .env."
+      echo "[$(date)]        No se sube nada offsite; el backup LOCAL si se ha hecho."
+      B2_ENABLED=false
+    fi
+    ;;
+esac
+
 if [ "$B2_ENABLED" = "true" ] && [ -n "$B2_BUCKET" ] && command -v rclone >/dev/null 2>&1; then
   echo "[$(date)] Sync to B2 bucket $B2_BUCKET …"
   # rclone debe estar configurado previamente con un remote llamado "b2-kemin"

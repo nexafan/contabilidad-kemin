@@ -132,6 +132,12 @@ Sin esto, si el VPS muere pierdes todo el histórico de tickets. Setup en 5 min:
 
 1. Crea cuenta en https://www.backblaze.com/b2 (gratis los primeros 10GB).
 2. Crea un bucket **privado** llamado `kemin-backups`.
+   > ⚠️ **El destino DEBE llevar subcarpeta**: `B2_BUCKET=kemin-backups/kemin`, nunca
+   > `kemin-backups` a secas. El backup hace `rclone sync`, que es un **espejo**: si
+   > apunta a la raíz del bucket, borra todo lo que no sea de KEMIN. Este bucket lo
+   > comparte el backup de NexaFans (carpeta `nexafans/`), y apuntar a la raíz le
+   > borró **6 días de copias de contratos y cédulas** (28-jul-2026) mientras su log
+   > seguía diciendo "offsite OK" todos los días.
 3. Application Keys → "Add a New Application Key" con scope solo a ese bucket. Anota `keyID` y `applicationKey`.
 4. En el VPS:
    ```bash
