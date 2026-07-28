@@ -668,6 +668,17 @@ function validDateOrNull(v) {
 function buildStockRow(input, user, isUpdate = false) {
   const evento = (input.evento || '').trim();
   if (!evento) throw new Error('evento requerido');
+  // El PRECIO DE COMPRA es obligatorio al dar de alta un ticket. Sin el, la fila
+  // entraba con price_retail = null y TODO el panel la contaba como coste 0: el
+  // beneficio de ese ticket salia igual a lo cobrado, la tesoreria no reflejaba el
+  // dinero puesto y el margen global quedaba inflado. Pasaba en silencio cuando el
+  // lector de capturas no conseguia leer el importe.
+  // Se exige que VENGA el campo, no que sea > 0: un ticket regalado se apunta como 0
+  // a proposito y eso si es un dato. En las EDICIONES no se exige, para no bloquear
+  // el guardado de filas antiguas que ya estaban sin precio.
+  if (!isUpdate && numOrNull(input.price_retail) === null) {
+    throw new Error('Falta el precio de compra. Si el ticket fue gratis, pon 0.');
+  }
   if (input.retailer && !RETAILERS.includes(input.retailer)) throw new Error('Retailer no válido: ' + input.retailer);
   const now = nowISO();
   const partial = {
@@ -2498,6 +2509,28 @@ async function processOcrFile(file) {
       el.textContent = v + '%';
       el.className = 'conf ' + (v >= 85 ? 'conf-hi' : v >= 60 ? 'conf-md' : 'conf-lo');
     }
+    // AVISO DE MONEDA: la IA detecta la moneda del ticket (currency_detected) pero el
+    // campo de precio es en DOLARES, y ese dato se estaba tirando. Un ticket de 120 EUR
+    // se guardaba como 120 USD y el beneficio salia inflado ~15% sin que nadie lo notara.
+    // NO se convierte solo a proposito: el cambio del dia lo decide quien apunta.
+    const moneda = String(fields.currency_detected || '').toUpperCase().trim();
+    let avisoMoneda = document.getElementById('ocr-aviso-moneda');
+    if (!avisoMoneda) {
+      avisoMoneda = document.createElement('div');
+      avisoMoneda.id = 'ocr-aviso-moneda';
+      avisoMoneda.style.cssText = 'margin:8px 0;padding:8px 12px;border-radius:8px;font-size:13px;display:none';
+      const contMoneda = document.getElementById('ocr-form');
+      if (contMoneda) contMoneda.insertBefore(avisoMoneda, contMoneda.firstChild);
+    }
+    if (moneda && moneda !== 'USD') {
+      avisoMoneda.style.display = '';
+      avisoMoneda.style.background = 'rgba(240,176,112,.15)';
+      avisoMoneda.style.color = '#f0b070';
+      avisoMoneda.innerHTML = String.fromCharCode(9888) + ' El ticket parece estar en <strong>' + moneda + '</strong>, pero el precio se guarda en <strong>USD</strong>. Convierte el importe antes de confirmar.';
+    } else {
+      avisoMoneda.style.display = 'none';
+    }
+    
     const n = parseInt(fields.n_tickets || 1);
     document.getElementById('ocr-footer-info').innerHTML = 'Se crearán <strong style="color: var(--cyan);">' + n + ' fila' + (n>1?'s':'') + '</strong> en STOCK';
     document.getElementById('ocr-confirm').disabled = false;
