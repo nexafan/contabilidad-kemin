@@ -622,21 +622,28 @@ app.get('/k/:token', (req, res) => {
 });
 
 app.use((req, res, next) => {
-  if (req.path === '/api/health' || req.path === '/manifest.json') return next();
+  // Solo el ping de salud queda fuera. El manifest NO: lleva el nombre del panel
+  // y el enlace de arranque, así que servirlo a pelo delataría lo que el 404 oculta.
+  if (req.path === '/api/health') return next();
   if (safeStrEq(readCookie(req, AUTH_COOKIE) || '', PANEL_TOKEN)) return next();
   return denegar(req, res);
 });
 
 app.get('/api/health', (req, res) => res.json({ ok: true, ts: nowISO() }));
 
-// PWA manifest — permite "Add to Home Screen" como app nativa
+// PWA manifest — permite "Add to Home Screen" como app nativa.
+// Va detrás de la cookie (lo instala el navegador que ya está dentro) y su
+// start_url lleva el enlace de acceso a propósito: en iOS la app del escritorio
+// tiene su propio almacén de cookies, así que arrancando por /k/<token> se pone
+// su cookie ella sola en vez de recibir un 404 nada más abrirla.
 app.get('/manifest.json', (req, res) => {
   const iconSvg = `<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0%' stop-color='#1d4ed8'/><stop offset='55%' stop-color='#22d3ee'/><stop offset='100%' stop-color='#a5f3fc'/></linearGradient></defs><rect width='64' height='64' rx='14' fill='url(#g)'/><text x='32' y='44' text-anchor='middle' font-family='Georgia,serif' font-style='italic' font-weight='700' font-size='34' fill='#07090d' letter-spacing='-2'>KF</text></svg>`;
-  res.set('Cache-Control', 'public, max-age=86400');
+  // Lleva el token dentro: privado siempre, nunca en caché compartida.
+  res.set('Cache-Control', 'private, no-store');
   res.json({
     name: 'KEMIN LLC · Panel',
     short_name: 'KEMIN',
-    start_url: '/',
+    start_url: `/k/${PANEL_TOKEN}`,
     scope: '/',
     display: 'standalone',
     orientation: 'portrait',
@@ -1062,7 +1069,7 @@ function renderPage(ctx) {
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
 <title>KEMIN · Panel</title>
 <meta name="theme-color" content="#07090d" />
-<link rel="manifest" href="/manifest.json" />
+<link rel="manifest" href="/manifest.json" crossorigin="use-credentials" />
 <meta name="apple-mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
 <meta name="apple-mobile-web-app-title" content="KEMIN" />

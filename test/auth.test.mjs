@@ -137,11 +137,23 @@ async function main() {
     const tampered = await fetch(`${BASE}/`, { headers: { cookie: 'kemin_auth=' + 'c'.repeat(32) } });
     check('una cookie inventada no entra', tampered.status === 404, `status=${tampered.status}`);
 
-    // --- lo que debe seguir abierto
+    // --- lo único que sigue abierto es el ping de salud
     const health = await fetch(`${BASE}/api/health`);
     check('/api/health sigue abierto', health.status === 200, `status=${health.status}`);
-    const manifest = await fetch(`${BASE}/manifest.json`);
-    check('/manifest.json sigue abierto (instalar como app)', manifest.status === 200, `status=${manifest.status}`);
+
+    // --- el manifest delataba el panel: ahora también pide cookie
+    const manifAnon = await fetch(`${BASE}/manifest.json`);
+    check('sin cookie el manifest NO se sirve', manifAnon.status === 404, `status=${manifAnon.status}`);
+    check('sin cookie no se filtra el nombre del panel',
+      !(await manifAnon.text()).includes('KEMIN'));
+
+    const manif = await fetch(`${BASE}/manifest.json`, { headers: { cookie } });
+    check('con cookie el manifest se sirve', manif.status === 200, `status=${manif.status}`);
+    const manifJson = await manif.json();
+    check('la app instalada arranca por el enlace (iOS tiene cookies aparte)',
+      manifJson.start_url === `/k/${TOKEN}`, manifJson.start_url);
+    check('el manifest no se guarda en cachés compartidas',
+      /no-store/.test(manif.headers.get('cache-control') || ''), manif.headers.get('cache-control'));
 
     // --- detrás de HTTPS la cookie debe ir marcada Secure
     const behindTls = await fetch(`${BASE}/k/${TOKEN}`, {
