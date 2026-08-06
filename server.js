@@ -598,6 +598,15 @@ function readCookie(req, name) {
 // Un 404 igual que el de cualquier dominio parado. Nada de "no autorizado": el
 // que llegue sin enlace no debe enterarse ni de que esto existe.
 function denegar(req, res) {
+  // Registro del rechazo para poder diagnosticar "no me abre" sin adivinar. La
+  // llave NUNCA se escribe en el log: solo cuántos caracteres traía, que es lo
+  // que delata un enlace copiado a medias (el bueno mide 48).
+  const ruta = req.path.startsWith('/k/')
+    ? `/k/<llave de ${req.path.slice(3).length} caracteres, deberían ser ${PANEL_TOKEN.length}>`
+    : req.path;
+  const galleta = req.headers.cookie?.includes(`${AUTH_COOKIE}=`) ? 'con cookie (no válida)' : 'sin cookie';
+  console.log(`[404] ${req.method} ${ruta} · ${galleta} · ${(req.headers['user-agent'] || '?').slice(0, 60)}`);
+
   res.status(404).set('Cache-Control', 'no-store');
   if (req.path.startsWith('/api/')) return res.json({ error: 'Not found' });
   return res.type('html').send(
