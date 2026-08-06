@@ -15,7 +15,7 @@ Panel web para contabilidad y stock de tickets para reventa. Pensado para una LL
 - **Finalizados** — operaciones cerradas filtrables por año / mes / semana / día.
 - **Pestañas dinámicas** — cuando un evento concentra muchos tickets (umbral configurable), se auto-genera una tab con vista filtrada y KPIs propios.
 - **OCR de capturas** — sube screenshot del retailer o del marketplace → Claude vision extrae evento, fecha, retailer, sección/fila/asiento, precio, n_tickets, con badge de confianza por campo. Edita lo que necesites y crea N filas de golpe.
-- **Cashback Slash 2%** — calculado automáticamente sobre todo el capital invertido.
+- **Cashback del banco 2%** — calculado automáticamente sobre todo el capital invertido.
 
 ---
 
@@ -66,7 +66,7 @@ Mira [`.env.example`](.env.example) para la lista completa. Lo crítico:
 | `DB_PATH` | Ruta del SQLite | `./data/kemin.db` |
 | `UPLOADS_DIR` | Carpeta para capturas | `./uploads` |
 | `EVENT_AUTO_TAB_THRESHOLD` | Umbral tickets para tab dinámica | `40` |
-| `SLASH_CASHBACK_RATE` | Tasa cashback (decimal) | `0.02` |
+| `CASHBACK_RATE` | Tasa de cashback del banco (decimal) | `0.02` |
 | `B2_ENABLED` | Backups off-site a Backblaze | `false` |
 
 ---

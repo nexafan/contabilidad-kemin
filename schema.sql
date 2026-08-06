@@ -106,7 +106,7 @@ CREATE TABLE IF NOT EXISTS ocr_log (
 CREATE INDEX IF NOT EXISTS idx_ocr_log_date ON ocr_log(uploaded_at);
 
 -- -----------------------------------------------------------------------------
--- CAPITAL_MOVEMENTS: depósitos y retiros de cash en la cuenta bancaria (Slash).
+-- CAPITAL_MOVEMENTS: depósitos y retiros de cash en la cuenta bancaria.
 -- Esto permite separar "dinero que tenemos en el banco" de "dinero invertido en
 -- tickets activos". El cash en banco = sum(deposits) - sum(withdrawals)
 --                                       + sum(payouts cobrados) + cashback
@@ -118,7 +118,7 @@ CREATE TABLE IF NOT EXISTS capital_movements (
   type         TEXT NOT NULL DEFAULT 'deposit',     -- deposit | withdrawal
   amount       REAL NOT NULL,                        -- USD (siempre positivo)
   fecha        TEXT NOT NULL,
-  source       TEXT,                                 -- 'Slash transfer' | 'Wire' | 'Wise' | ...
+  source       TEXT,                                 -- 'Transferencia bancaria' | 'Wire' | 'Wise' | ...
   notas        TEXT,
   created_at   TEXT NOT NULL,
   updated_at   TEXT NOT NULL

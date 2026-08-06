@@ -28,7 +28,7 @@ const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5';
 const DB_PATH = process.env.DB_PATH || './data/kemin.db';
 const UPLOADS_DIR = process.env.UPLOADS_DIR || './uploads';
 const EVENT_AUTO_TAB_THRESHOLD = parseInt(process.env.EVENT_AUTO_TAB_THRESHOLD || '40', 10);
-const SLASH_CASHBACK_RATE = parseFloat(process.env.SLASH_CASHBACK_RATE || '0.02');
+const CASHBACK_RATE = parseFloat(process.env.CASHBACK_RATE || '0.02');
 
 const RETAILERS = ['AXS', 'TICKETMASTER', 'TICKETONE', 'TICKETCORNER', 'SEETICKETS', 'EVENTIM', 'OTHER'];
 const SELLING_PLATFORMS = ['StubHub', 'Ticombo', 'AXS Resale', 'Viagogo', 'Vivid Seats', 'Other'];
@@ -310,7 +310,7 @@ function calcTreasury() {
   const payoutsCobrados = buckets.cobrados.reduce((s, r) => s + (r.payout_amount || 0), 0)
                         + buckets.perdidas.reduce((s, r) => s + (r.payout_amount || 0), 0);
   const gastosPagados   = expenses.reduce((s, e) => s + (e.total_pagado || 0), 0);
-  const cashback        = totalInvertido * SLASH_CASHBACK_RATE;
+  const cashback        = totalInvertido * CASHBACK_RATE;
 
   // Cash en banco: salen depositos − retiros − allocations + returns + payouts + cashback − compras propias − gastos − commisiones pagadas
   // (las compras de runner NO se descuentan: salieron cuando se hizo la allocation)
@@ -335,7 +335,7 @@ function calcTreasury() {
     capitalConRunners,
     runnerStats,
     buckets: {
-      cashEnBanco:      { amount: cashEnBanco, count: capMovs.length, label: 'Cash en Slash' },
+      cashEnBanco:      { amount: cashEnBanco, count: capMovs.length, label: 'Cash en banco' },
       sinListar:        { amount: capSinListar, count: buckets.sinListar.length },
       listado:          { amount: capListado,   count: buckets.listado.length },
       pendingPayout:    { amount: capPending,   count: buckets.pendingPayout.length },
@@ -412,7 +412,7 @@ function calcDashboard(fromISO, toISO) {
 
   const expenses = Q.allExpenses.all().filter(e => e.fecha >= fromISO && e.fecha <= toISO);
   const expensesTotal = expenses.reduce((s, e) => s + (e.total_pagado || 0), 0);
-  const cashback = rows.reduce((s, r) => s + (r.price_retail || 0), 0) * SLASH_CASHBACK_RATE;
+  const cashback = rows.reduce((s, r) => s + (r.price_retail || 0), 0) * CASHBACK_RATE;
 
   const beneficioNetoReal = profitNeto + cashback - expensesTotal; // lost ya está dentro de profitNeto (negativo)
   const capitalInv = rows.reduce((s, r) => s + (r.price_retail || 0), 0);
@@ -889,7 +889,7 @@ app.post('/api/capital', (req, res) => {
       type,
       amount,
       fecha: req.body.fecha || today(),
-      source: req.body.source || (type === 'deposit' ? 'Slash transfer' : null),
+      source: req.body.source || (type === 'deposit' ? 'Transferencia bancaria' : null),
       notas: req.body.notas || null,
       runner_tag: req.body.runner_tag || null,
       created_at: now,
@@ -1177,7 +1177,7 @@ function renderTesoreriaPage(t) {
           <div class="treasury-delta">${t.deposits > 0 ? `${fmtUSD(t.deposits)} aportado · ${fmtUSD(t.cashback)} cashback` : 'snapshot ahora'}</div>
         </div>
         <div class="treasury-bars">
-          ${bar('d-green', '💵 Cash en Slash (disponible)', buckets.cashEnBanco.amount, pct(buckets.cashEnBanco.amount), '--green')}
+          ${bar('d-green', '💵 Cash en banco (disponible)', buckets.cashEnBanco.amount, pct(buckets.cashEnBanco.amount), '--green')}
           ${buckets.capitalConRunners.amount > 0 ? bar('d-violet', '💼 Capital con runners', buckets.capitalConRunners.amount, pct(buckets.capitalConRunners.amount), '--violet') : ''}
           ${bar('d-cyan', '🛒 Stock sin listar', buckets.sinListar.amount, pct(buckets.sinListar.amount), '--cyan')}
           ${bar('d-blue', '🏷 Stock listado para vender', buckets.listado.amount, pct(buckets.listado.amount), '--blue')}
@@ -1195,7 +1195,7 @@ function renderTesoreriaPage(t) {
 
     <div class="collapse-target">
       <div class="kpi-grid stagger">
-        ${kpiCard('💵 Cash en Slash', fmtUSD(buckets.cashEnBanco.amount), `disponible para comprar`, 'accent-green', null, 'Depósitos − retiros − allocations + returns + payouts + cashback − compras propias − gastos − comisiones pagadas')}
+        ${kpiCard('💵 Cash en banco', fmtUSD(buckets.cashEnBanco.amount), `disponible para comprar`, 'accent-green', null, 'Depósitos − retiros − allocations + returns + payouts + cashback − compras propias − gastos − comisiones pagadas')}
         ${buckets.capitalConRunners.amount > 0 ? kpiCard('💼 Capital con runners', fmtUSD(buckets.capitalConRunners.amount), `${buckets.capitalConRunners.count} runners activos`, 'accent-violet clickable', null, 'Capital asignado a runners aún no gastado en tickets ni devuelto. Click → tab Runners.') : ''}
         ${kpiCard('🛒 Stock sin listar', fmtUSD(buckets.sinListar.amount), `${buckets.sinListar.count} tickets · esperando publicación`, 'accent-cyan clickable', 'comprado')}
         ${kpiCard('🏷 Stock listado', fmtUSD(buckets.listado.amount), `${buckets.listado.count} tickets · en marketplaces`, 'accent-blue clickable', 'listed')}
@@ -1203,7 +1203,7 @@ function renderTesoreriaPage(t) {
         ${kpiCard('✅ Profit realizado', (buckets.profitRealizado.amount >= 0 ? '+' : '') + fmtUSD(buckets.profitRealizado.amount), `${buckets.profitRealizado.count} cerrados con beneficio`, 'accent-green clickable', 'cobrado')}
         ${kpiCard('📉 Pérdidas realizadas', fmtUSD(buckets.perdidas.amount), `${buckets.perdidas.count} tickets cerrados a pérdida`, 'accent-red clickable', 'lost')}
         ${kpiCard('⏰ < 7 días, sin vender', fmtUSD(t.lt7.amount), `${t.lt7.count} tickets · urge bajar precio`, 'clickable', null)}
-        ${kpiCard('💳 Cashback Slash (2%)', fmtUSD(t.cashback), `${fmtUSD(t.totalInvertido)} invertido × 2%`, 'accent-green', null, 'Slash devuelve 2% por cada compra (incluidas compras de runners). Sumado al cash.')}
+        ${kpiCard('💳 Cashback banco (2%)', fmtUSD(t.cashback), `${fmtUSD(t.totalInvertido)} invertido × 2%`, 'accent-green', null, 'El banco devuelve 2% por cada compra (incluidas compras de runners). Sumado al cash.')}
       </div>
     </div>
   </section>`;
@@ -1436,7 +1436,7 @@ function renderDashboardPage(d) {
         ${kpiCard('Profit neto', (d.profitNeto >= 0 ? '+' : '') + fmtUSD(d.profitNeto), 'realizado', 'accent-green')}
         ${kpiCard('Lost', fmtUSD(d.lost), 'tickets fallidos', 'accent-red')}
         ${kpiCard('Expenses', fmtUSD(d.expensesTotal), 'incluye bot-ops', 'accent-amber')}
-        ${kpiCard('Beneficio neto real', (d.beneficioNetoReal >= 0 ? '+' : '') + fmtUSD(d.beneficioNetoReal), 'Profit + Cashback − Lost − Gastos', 'accent-cyan', null, 'Profit cerrado − Pérdidas − Gastos operativos + Cashback Slash 2%')}
+        ${kpiCard('Beneficio neto real', (d.beneficioNetoReal >= 0 ? '+' : '') + fmtUSD(d.beneficioNetoReal), 'Profit + Cashback − Lost − Gastos', 'accent-cyan', null, 'Profit cerrado − Pérdidas − Gastos operativos + Cashback banco 2%')}
         ${kpiCard('ROI total', fmtPct(d.roi, 0), 'sobre capital invertido')}
       </div>
     </div>
@@ -1590,7 +1590,7 @@ function renderRunnersPage(runners) {
   return `
   <section class="page" id="page-runners">
     <h1 class="section-title collapsible"><span class="chev">▾</span> Runners</h1>
-    <p class="section-sub">Personas externas que compran tickets para KEMIN con tarjetas Slash asignadas. Cada runner es su propio mini-Stock con su comisión %.</p>
+    <p class="section-sub">Personas externas que compran tickets para KEMIN con tarjetas del banco asignadas. Cada runner es su propio mini-Stock con su comisión %.</p>
 
     <div class="collapse-target">
       <div class="toolbar">
@@ -1600,7 +1600,7 @@ function renderRunnersPage(runners) {
       </div>
 
       ${runners.length === 0
-        ? `<div class="empty-state">${emptyStateInTable('Sin runners aún', 'Crea uno y le asignas capital de tus tarjetas Slash. Cobra % sobre profit cuando vendes lo que él compre.', '🏃')}</div>`
+        ? `<div class="empty-state">${emptyStateInTable('Sin runners aún', 'Crea uno y le asignas capital de tus tarjetas. Cobra % sobre profit cuando vendes lo que él compre.', '🏃')}</div>`
         : runners.map(renderRunnerBlock).join('')
       }
     </div>
@@ -1713,7 +1713,7 @@ function renderCapitalModal() {
         <div class="ocr-field"><label>Cantidad (USD) *</label><input type="number" step="0.01" name="amount" required placeholder="25000" /></div>
         <div class="ocr-field-row">
           <div class="ocr-field"><label>Fecha</label><input type="date" name="fecha" /></div>
-          <div class="ocr-field" style="grid-column: span 2;"><label>Origen / Concepto</label><input type="text" name="source" placeholder="Slash transfer" value="Slash transfer" /></div>
+          <div class="ocr-field" style="grid-column: span 2;"><label>Origen / Concepto</label><input type="text" name="source" placeholder="Transferencia bancaria" value="Transferencia bancaria" /></div>
         </div>
         <div class="ocr-field"><label>Notas (opcional)</label><input type="text" name="notas" placeholder="ej. capital inicial Fer+Kevin 50/50" /></div>
         <div style="display: flex; gap: 10px; justify-content: flex-end; margin-top: 22px;">
@@ -2671,8 +2671,8 @@ window.saveEdit = async function(ev) {
 };
 // Capital modal — soporta deposit, withdrawal, allocation, return, commission
 const CAP_LABELS = {
-  deposit: { title: '💵 Inyección de capital (deposit)', info: 'Entra cash en el banco Slash.', source: 'Slash transfer' },
-  withdrawal: { title: '⤓ Retiro de capital', info: 'Sale cash del banco Slash a una cuenta externa.', source: '' },
+  deposit: { title: '💵 Inyección de capital (deposit)', info: 'Entra cash en el banco.', source: 'Transferencia bancaria' },
+  withdrawal: { title: '⤓ Retiro de capital', info: 'Sale cash del banco a una cuenta externa.', source: '' },
   allocation: { title: '＋ Asignar capital a runner', info: '', source: 'Allocation' },
   return: { title: '⤓ Devolución de capital del runner', info: '', source: 'Return' },
   commission: { title: '💸 Pagar comisión al runner', info: '', source: 'Commission payment' }
