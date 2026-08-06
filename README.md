@@ -43,13 +43,13 @@ npm install
 
 # 3) Config
 cp .env.example .env
-# edita .env con tus credenciales (mínimo: PANEL_USERS, ANTHROPIC_API_KEY)
+# edita .env con tus credenciales (mínimo: PANEL_TOKEN, ANTHROPIC_API_KEY)
 
 # 4) Arrancar
 npm start
 ```
 
-Abre `http://localhost:4125`, login con cualquier user definido en `PANEL_USERS`. La DB se crea sola (`./data/kemin.db`).
+Abre `http://localhost:4125/k/<tu PANEL_TOKEN>`. No hay usuario ni contraseña: ese enlace deja una cookie que dura un año y a partir de ahí entras por `http://localhost:4125` a secas. Sin la cookie, todo responde `404`. La DB se crea sola (`./data/kemin.db`).
 
 ---
 
@@ -60,7 +60,7 @@ Mira [`.env.example`](.env.example) para la lista completa. Lo crítico:
 | Variable | Descripción | Default |
 |---|---|---|
 | `PORT` | Puerto del servidor | `4125` |
-| `PANEL_USERS` | Usuarios `"u1:p1,u2:p2"` (auth básica) | `admin:admin` ⚠ |
+| `PANEL_TOKEN` | Llave del panel: se entra por `/k/<token>`. Mínimo 24 caracteres, `openssl rand -hex 24`. **Sin él el panel no arranca** | — |
 | `ANTHROPIC_API_KEY` | Para OCR — saca en https://console.anthropic.com/settings/keys | — |
 | `ANTHROPIC_MODEL` | Modelo vision | `claude-haiku-4-5` |
 | `DB_PATH` | Ruta del SQLite | `./data/kemin.db` |
@@ -205,11 +205,12 @@ contabilidad-kemin/
 
 ## API
 
-Todos los endpoints requieren auth básica.
+Todos los endpoints piden la cookie `kemin_auth`, que se obtiene abriendo una vez `/k/<PANEL_TOKEN>`. Sin ella responden `404` (nunca `401`: no queremos anunciar que aquí hay un panel).
 
 | Método | Endpoint | Descripción |
 |---|---|---|
 | `GET`  | `/` | Panel HTML completo |
+| `GET`  | `/k/:token` | Enlace de acceso: deja la cookie y redirige a `/` (sin auth) |
 | `GET`  | `/api/health` | Ping (sin auth) |
 | `GET`  | `/api/stock` | Listar todos los tickets |
 | `POST` | `/api/stock` | Crear ticket |
@@ -220,7 +221,7 @@ Todos los endpoints requieren auth básica.
 | `GET`  | `/api/events` | Eventos (auto-creados al insertar stock) |
 | `PATCH`| `/api/events/:nombre` | Pin/hide tab dinámica |
 | `POST` | `/api/ocr` | Multipart con `image` → JSON con campos detectados |
-| `GET`  | `/uploads/*` | Servir capturas (auth-protected) |
+| `GET`  | `/uploads/*` | Servir capturas (tras la cookie) |
 
 ---
 
@@ -273,7 +274,11 @@ El código está pensado para que un dev junior pueda iterarlo. Convenciones:
 
 ## Troubleshooting
 
-**El panel no arranca.** Mira los logs: `pm2 logs contabilidad-kemin`. Lo más común: falta `ANTHROPIC_API_KEY` o `PANEL_USERS` mal formateado.
+**El panel no arranca.** Mira los logs: `pm2 logs contabilidad-kemin`. Lo más común: falta `PANEL_TOKEN` en el `.env` (o tiene menos de 24 caracteres) — el panel se niega a arrancar sin él a propósito, para no quedar abierto a cualquiera. También puede faltar `ANTHROPIC_API_KEY`.
+
+**Se ha filtrado el enlace / se ha perdido un móvil.** Cambia `PANEL_TOKEN` en el `.env` y `pm2 restart contabilidad-kemin`. Todas las cookies repartidas dejan de valer al instante; hay que volver a abrir el enlace nuevo en cada dispositivo.
+
+**Sale un 404 al entrar.** Es lo esperado si el navegador no tiene la cookie (otro dispositivo, modo incógnito, o pasó un año). Vuelve a abrir `/k/<PANEL_TOKEN>`.
 
 **OCR devuelve null en muchos campos.** La captura es de baja resolución o el modelo no la entiende. Prueba con Sonnet (`ANTHROPIC_MODEL=claude-sonnet-4-6`) que es ~5× más preciso aunque 10× más caro.
 

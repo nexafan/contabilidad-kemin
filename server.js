@@ -12,7 +12,7 @@ import express from 'express';
 import multer from 'multer';
 import Database from 'better-sqlite3';
 import Anthropic from '@anthropic-ai/sdk';
-import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { randomUUID, randomBytes, timingSafeEqual } from 'node:crypto';
 import { readFileSync, mkdirSync, existsSync, renameSync, statSync, unlinkSync } from 'node:fs';
 import { join, dirname, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -23,7 +23,6 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // Config
 // -----------------------------------------------------------------------------
 const PORT = parseInt(process.env.PORT || '4125', 10);
-const PANEL_USERS = parsePanelUsers(process.env.PANEL_USERS || 'admin:admin');
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5';
 const DB_PATH = process.env.DB_PATH || './data/kemin.db';
@@ -37,14 +36,37 @@ const TICKET_TYPES = ['MOBILE TRANSFER', 'PDF', 'HARD COPY', 'OTHER'];
 const STATUSES = ['comprado', 'listed', 'sold', 'cobrado', 'lost'];
 const EXPENSE_CATEGORIES = ['Proxy', 'Bot', 'Suscripción', 'Servidor', 'Bot operator', 'Otro'];
 
-function parsePanelUsers(s) {
-  const out = {};
-  for (const pair of s.split(',').map(x => x.trim()).filter(Boolean)) {
-    const i = pair.indexOf(':');
-    if (i <= 0) continue;
-    out[pair.slice(0, i)] = pair.slice(i + 1);
-  }
-  return out;
+// -----------------------------------------------------------------------------
+// Puerta de entrada: enlace secreto, sin usuario ni contraseña.
+//
+// El panel no pregunta nada al entrar. Toda la protección vive en el enlace:
+// se abre UNA vez `/k/<PANEL_TOKEN>`, el server deja una cookie que dura un año
+// y a partir de ahí `panel.kemin-seat.com` entra directo. Quien no tenga el
+// enlace ve un 404 seco — ni un formulario, ni un "no autorizado", nada que
+// delate que aquí hay un panel de contabilidad.
+//
+// Consecuencia a tener presente: el enlace ES la llave. Si se filtra (se manda
+// por un chat que no toca, se pierde el móvil), se cambia PANEL_TOKEN en el
+// .env y se reinicia: las cookies viejas dejan de valer al instante.
+// -----------------------------------------------------------------------------
+const PANEL_TOKEN = (process.env.PANEL_TOKEN || '').trim();
+const AUTH_COOKIE = 'kemin_auth';
+const COOKIE_MAX_AGE = 60 * 60 * 24 * 365; // 1 año
+
+// Fail-closed a propósito: si no hay token, el panel NO arranca. Arrancar sin él
+// dejaría la contabilidad de la LLC abierta a cualquiera que escriba el dominio,
+// y eso no puede pasar por un despiste al editar el .env.
+if (PANEL_TOKEN.length < 24) {
+  console.error('');
+  console.error('  ERROR: falta PANEL_TOKEN en el .env (o es demasiado corto: mínimo 24 caracteres).');
+  console.error('  Sin él el panel quedaría abierto a cualquiera, así que no arranca.');
+  console.error('');
+  console.error('  Añade esta línea al .env y vuelve a arrancar:');
+  console.error(`      PANEL_TOKEN=${randomBytes(24).toString('hex')}`);
+  console.error('');
+  console.error('  Tu enlace de acceso será entonces:  https://TU-DOMINIO/k/<ese valor>');
+  console.error('');
+  process.exit(1);
 }
 
 // -----------------------------------------------------------------------------
@@ -552,7 +574,7 @@ const upload = multer({
   limits: { fileSize: 12 * 1024 * 1024 } // 12 MB
 });
 
-// Auth básica con timing-safe compare
+// Comparación en tiempo constante: no revela el token a base de cronometrar respuestas
 function safeStrEq(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string') return false;
   const bufA = Buffer.from(a);
@@ -563,20 +585,47 @@ function safeStrEq(a, b) {
   const padB = Buffer.alloc(len); bufB.copy(padB);
   return timingSafeEqual(padA, padB) && bufA.length === bufB.length;
 }
-app.use((req, res, next) => {
-  if (req.path.startsWith('/api/health') || req.path === '/manifest.json') return next();
-  const auth = req.headers.authorization || '';
-  if (!auth.startsWith('Basic ')) return askAuth(res);
-  const [user, pass] = Buffer.from(auth.slice(6), 'base64').toString('utf8').split(':');
-  const expected = PANEL_USERS[user];
-  if (!expected || !safeStrEq(expected, pass || '')) return askAuth(res);
-  req.user = user;
-  next();
-});
-function askAuth(res) {
-  res.set('WWW-Authenticate', 'Basic realm="KEMIN Panel"');
-  return res.status(401).send('Auth required');
+function readCookie(req, name) {
+  for (const part of (req.headers.cookie || '').split(';')) {
+    const i = part.indexOf('=');
+    if (i < 0) continue;
+    if (part.slice(0, i).trim() !== name) continue;
+    try { return decodeURIComponent(part.slice(i + 1).trim()); } catch { return null; }
+  }
+  return null;
 }
+
+// Un 404 igual que el de cualquier dominio parado. Nada de "no autorizado": el
+// que llegue sin enlace no debe enterarse ni de que esto existe.
+function denegar(req, res) {
+  res.status(404).set('Cache-Control', 'no-store');
+  if (req.path.startsWith('/api/')) return res.json({ error: 'Not found' });
+  return res.type('html').send(
+    `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
+    `<title>404</title><body style="margin:0;height:100vh;display:flex;align-items:center;justify-content:center;` +
+    `background:#07090d;color:#4b5563;font:14px/1.6 -apple-system,system-ui,sans-serif">404</body>`
+  );
+}
+
+// El enlace de acceso: se abre una vez y deja la cookie puesta durante un año.
+app.get('/k/:token', (req, res) => {
+  if (!safeStrEq(req.params.token || '', PANEL_TOKEN)) return denegar(req, res);
+  // Secure solo cuando venimos por HTTPS (en el VPS lo dice Caddy con esta cabecera);
+  // en local, por http, marcarla Secure haría que el navegador la tirase.
+  const secure = req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
+  res.set('Set-Cookie',
+    `${AUTH_COOKIE}=${encodeURIComponent(PANEL_TOKEN)}; Path=/; Max-Age=${COOKIE_MAX_AGE}; HttpOnly; SameSite=Lax${secure}`);
+  res.set('Cache-Control', 'no-store');
+  // Redirigimos a '/' para que el token no se quede en la barra del navegador,
+  // ni en el historial de la página, ni se filtre por Referer al pedir recursos.
+  return res.redirect(302, '/');
+});
+
+app.use((req, res, next) => {
+  if (req.path === '/api/health' || req.path === '/manifest.json') return next();
+  if (safeStrEq(readCookie(req, AUTH_COOKIE) || '', PANEL_TOKEN)) return next();
+  return denegar(req, res);
+});
 
 app.get('/api/health', (req, res) => res.json({ ok: true, ts: nowISO() }));
 
@@ -610,7 +659,7 @@ app.get('/api/stock', (req, res) => {
 
 app.post('/api/stock', (req, res) => {
   try {
-    const row = buildStockRow(req.body, req.user);
+    const row = buildStockRow(req.body);
     Q.insertStock.run(row);
     upsertEvent(row.evento, row.event_date);
     res.json({ ok: true, id: row.id });
@@ -627,7 +676,7 @@ app.post('/api/stock/bulk', (req, res) => {
     const ids = [];
     const tx = db.transaction((arr) => {
       for (const it of arr) {
-        const row = buildStockRow({ ...it, ocr_log_id: ocrLogId }, req.user);
+        const row = buildStockRow({ ...it, ocr_log_id: ocrLogId });
         Q.insertStock.run(row);
         upsertEvent(row.evento, row.event_date);
         ids.push(row.id);
@@ -646,7 +695,7 @@ app.patch('/api/stock/:id', (req, res) => {
   if (!existing) return res.status(404).json({ error: 'not found' });
   try {
     const merged = { ...existing, ...req.body, id: existing.id };
-    const row = buildStockRow(merged, req.user, /*isUpdate*/ true);
+    const row = buildStockRow(merged, /*isUpdate*/ true);
     Q.updateStock.run(row);
     res.json({ ok: true });
   } catch (e) {
@@ -665,7 +714,7 @@ function validDateOrNull(v) {
   if (!ISO_DATE_RE.test(v)) throw new Error('Fecha inválida (formato YYYY-MM-DD): ' + v);
   return v;
 }
-function buildStockRow(input, user, isUpdate = false) {
+function buildStockRow(input, isUpdate = false) {
   const evento = (input.evento || '').trim();
   if (!evento) throw new Error('evento requerido');
   // El PRECIO DE COMPRA es obligatorio al dar de alta un ticket. Sin el, la fila
@@ -926,7 +975,7 @@ app.post('/api/ocr', upload.single('image'), async (req, res) => {
       cost_usd: result.cost_usd,
       result_json: JSON.stringify(result.parsed || { raw: result.raw }),
       created_stock_ids: null,
-      user: req.user || null,
+      user: null,   // ya no hay usuarios: Fer y Kevin operan como uno solo
       error: result.parseError || null
     });
 
@@ -969,7 +1018,6 @@ app.get('/', (req, res) => {
   res.set('Cache-Control', 'no-store');
   const runners = calcRunners(stockAll, Q.allCapital.all(), Q.allRunners.all());
   res.send(renderPage({
-    user: req.user,
     treasury, stockAll, stockActive, expenses, eventTabs, runners,
     finalizados, finalizadosPeriod, dash,
     constants: { RETAILERS, SELLING_PLATFORMS, TICKET_TYPES, EXPENSE_CATEGORIES, STATUSES }
@@ -1055,7 +1103,7 @@ function renderPage(ctx) {
       </div>
     </div>
     <div class="header-right">
-      <div class="user-chip">${esc(ctx.user || '')} · sesión activa</div>
+      <div class="status-chip">en línea</div>
       <div class="meta-info">${esc(new Date().toLocaleString('es-ES'))}</div>
     </div>
   </header>
@@ -1851,9 +1899,9 @@ header { display: flex; justify-content: space-between; align-items: flex-start;
   letter-spacing: -0.5px; }
 .brand-sub { font-size: 12px; color: var(--text-mute); text-transform: uppercase; letter-spacing: 2px; font-weight: 500; }
 .header-right { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
-.user-chip { display: inline-flex; align-items: center; gap: 8px; background: var(--surface); border: 1px solid var(--border);
+.status-chip { display: inline-flex; align-items: center; gap: 8px; background: var(--surface); border: 1px solid var(--border);
   border-radius: 999px; padding: 6px 14px; font-size: 12px; color: var(--text-dim); }
-.user-chip::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px var(--green); }
+.status-chip::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px var(--green); }
 .meta-info { font-size: 11px; color: var(--text-mute); }
 .tabs { display: flex; gap: 4px; background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
   padding: 6px; margin-bottom: 28px; overflow-x: auto; flex-wrap: wrap; }
@@ -2171,7 +2219,7 @@ tr:hover .row-menu { color: var(--text-dim); }
   .modal-footer { flex-direction: column; align-items: stretch; gap: 12px; padding: 14px 18px; }
   .modal-footer > div { display: flex; gap: 10px; }
   .modal-footer .btn { flex: 1; }
-  .user-chip { font-size: 10px; padding: 4px 10px; }
+  .status-chip { font-size: 10px; padding: 4px 10px; }
 }
 @media (max-width: 420px) {
   .kpi-grid { grid-template-columns: 1fr; }
@@ -2780,5 +2828,5 @@ app.listen(PORT, () => {
   console.log(`DB: ${DB_PATH}`);
   console.log(`Uploads: ${UPLOADS_DIR}`);
   console.log(`Modelo OCR: ${ANTHROPIC_MODEL}`);
-  console.log(`Usuarios: ${Object.keys(PANEL_USERS).join(', ')}`);
+  console.log(`Enlace de acceso: /k/${PANEL_TOKEN.slice(0, 4)}…${PANEL_TOKEN.slice(-4)} (completo en el .env)`);
 });
