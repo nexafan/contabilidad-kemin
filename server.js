@@ -666,6 +666,34 @@ app.get('/manifest.json', (req, res) => {
 });
 
 // =============================================================================
+// API — FX (tipo de cambio para anotar tickets en EUR/GBP y guardarlos en USD)
+// =============================================================================
+// El panel guarda TODO en USD. Cuando la captura viene en otra moneda, el cliente
+// pide aquí la tasa del día y convierte antes de crear las filas. Fuente:
+// frankfurter.app (BCE, sin API key). Cache de 12h para no depender de la red.
+const fxCache = {}; // { EUR: { rate, ts } }
+app.get('/api/fx/:from', async (req, res) => {
+  const from = String(req.params.from || '').toUpperCase();
+  if (!/^[A-Z]{3}$/.test(from)) return res.status(400).json({ error: 'moneda inválida' });
+  if (from === 'USD') return res.json({ rate: 1, from, to: 'USD' });
+  const hit = fxCache[from];
+  if (hit && Date.now() - hit.ts < 12 * 3600 * 1000) return res.json({ rate: hit.rate, from, to: 'USD', cached: true });
+  try {
+    const r = await fetch(`https://api.frankfurter.app/latest?from=${from}&to=USD`);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const j = await r.json();
+    const rate = Number(j?.rates?.USD);
+    if (!rate || isNaN(rate)) throw new Error('respuesta sin tasa');
+    fxCache[from] = { rate, ts: Date.now() };
+    res.json({ rate, from, to: 'USD' });
+  } catch (e) {
+    // Si hay cache viejo, mejor eso que nada
+    if (hit) return res.json({ rate: hit.rate, from, to: 'USD', cached: true, stale: true });
+    res.status(502).json({ error: 'No pude obtener el tipo de cambio ' + from + '→USD: ' + e.message });
+  }
+});
+
+// =============================================================================
 // API — STOCK
 // =============================================================================
 app.get('/api/stock', (req, res) => {
@@ -1746,7 +1774,7 @@ function renderOcrModal() {
       </div>
       <div class="modal-fields" id="ocr-fields">
         <div class="ocr-status" id="ocr-status">Sube una captura para empezar.</div>
-        <div id="ocr-form" style="display:none;">
+        <form id="ocr-form" style="display:none;" onsubmit="return false;">
           ${ocrField('Evento', 'evento', 'text')}
           <div class="ocr-field-row">
             ${ocrField('Bought Date', 'bought_date', 'date')}
@@ -1759,17 +1787,17 @@ function renderOcrModal() {
             ${ocrField('Asiento', 'asiento', 'text')}
           </div>
           <div class="ocr-field-row">
-            ${ocrField('Precio retail (USD)', 'price_retail', 'number')}
+            ${ocrField('Precio retail (en la moneda elegida)', 'price_retail', 'number')}
             ${ocrField('N tickets', 'n_tickets', 'number')}
             ${ocrField('Cuenta del retailer', 'cuenta', 'text')}
           </div>
           <div class="ocr-field-row">
             <div class="ocr-field"><label>Origen <span class="conf" style="background:rgba(139,92,246,0.15);color:var(--violet);">runner</span></label><select name="origin" id="ocr-origin"><option value="manual">Manual (compra propia)</option></select></div>
             ${ocrSelect('Selling platform', 'selling_platform', ['', ...SELLING_PLATFORMS])}
-            <div></div>
+            ${ocrSelect('Moneda del precio', 'currency', ['USD', 'EUR', 'GBP'])}
           </div>
           ${ocrField('Notas', 'notas', 'text')}
-        </div>
+        </form>
       </div>
     </div>
     <div class="modal-footer">
@@ -2586,11 +2614,13 @@ async function processOcrFile(file) {
       const contMoneda = document.getElementById('ocr-form');
       if (contMoneda) contMoneda.insertBefore(avisoMoneda, contMoneda.firstChild);
     }
+    const selMoneda = document.querySelector('#ocr-form [name="currency"]');
+    if (selMoneda) selMoneda.value = ['USD','EUR','GBP'].includes(moneda) ? moneda : 'USD';
     if (moneda && moneda !== 'USD') {
       avisoMoneda.style.display = '';
       avisoMoneda.style.background = 'rgba(240,176,112,.15)';
       avisoMoneda.style.color = '#f0b070';
-      avisoMoneda.innerHTML = String.fromCharCode(9888) + ' El ticket parece estar en <strong>' + moneda + '</strong>, pero el precio se guarda en <strong>USD</strong>. Convierte el importe antes de confirmar.';
+      avisoMoneda.innerHTML = String.fromCharCode(9888) + ' Ticket detectado en <strong>' + moneda + '</strong>. Escribe el precio tal cual en ' + moneda + ' — al crear los tickets se convierte a USD con la tasa del día.';
     } else {
       avisoMoneda.style.display = 'none';
     }
@@ -2611,6 +2641,19 @@ window.confirmOcr = async function() {
   const n = parseInt(obj.n_tickets || 1);
   if (isNaN(n) || n < 1) { toast('N tickets inválido', 'error'); return; }
   delete obj.n_tickets;
+  // Conversión de moneda: el panel guarda todo en USD. Si el precio se anotó en
+  // EUR/GBP, se convierte aquí con la tasa del día y se deja constancia en notas.
+  const curr = (obj.currency || 'USD').toUpperCase();
+  delete obj.currency;
+  if (curr !== 'USD' && obj.price_retail !== '' && obj.price_retail != null) {
+    const fx = await fetch('/api/fx/' + curr);
+    if (!fx.ok) { toast('No pude obtener la tasa ' + curr + '→USD. Convierte el precio a mano o reintenta.', 'error'); return; }
+    const { rate } = await fx.json();
+    const original = Number(obj.price_retail);
+    obj.price_retail = Math.round(original * rate * 100) / 100;
+    const nota = 'Precio original ' + original + ' ' + curr + ' @ ' + rate.toFixed(4) + ' = $' + obj.price_retail;
+    obj.notas = obj.notas ? obj.notas + ' · ' + nota : nota;
+  }
   const items = Array.from({length: n}, () => ({...obj}));
   const body = { items, ocr_log_id: window.__ocr?.ocr_log_id };
   const btn = document.getElementById('ocr-confirm');
