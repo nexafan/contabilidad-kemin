@@ -504,8 +504,8 @@ Devuelve EXCLUSIVAMENTE un JSON válido con esta forma (sin markdown, sin texto 
   "fila": "...",
   "asiento": "...",
   "n_tickets": <int>,
-  "price_retail_per_ticket": <float or null>,
-  "price_total": <float or null>,
+  "price_retail_per_ticket": <float or null>,   // TODO INCLUIDO: base + gastos de gestion
+  "price_total": <float or null>,               // lo que se cobro a la tarjeta, todo incluido
   "currency_detected": "USD|EUR|GBP|...",
   "confidence": {
     "evento": 0-100,
@@ -534,7 +534,12 @@ Reglas:
   currency_detected: "EUR".
 - Formato numerico: punto como decimal y sin separador de miles. "1.234,56" -> 1234.56,
   "89,50" -> 89.5, "$1,250.00" -> 1250.
-- "price_retail_per_ticket" es el precio de UN ticket; "price_total" el del pedido entero.
+- "price_retail_per_ticket" es lo que COSTO UN ticket con TODO incluido: precio base MAS
+  su parte de gastos de gestion / booking fee / service charge / cargo por servicio.
+  Un recibo con "Importe 31,00 EUR + Gastos de gestion 4,00 EUR = Total 35,00 EUR" es
+  price_retail_per_ticket: 35, NO 31. Si la comision solo aparece en el total del pedido,
+  repartela entre las entradas. Anota el desglose en "raw_notes".
+- "price_total" es el importe final cobrado a la tarjeta, tambien con gastos incluidos.
   Si solo se ve el total, deja per_ticket en null (el panel divide entre n_tickets).
 - FECHAS CON AÑO DE 2 CIFRAS: "29/9/26" es 2026, NUNCA 2024 ni 2029. Un "YY" suelto
   siempre es 20YY. Formato de la mayoria de recibos europeos: DD/MM/AA o DD/MM/AAAA.
@@ -1809,7 +1814,7 @@ function renderOcrModal() {
             ${ocrField('Asiento', 'asiento', 'text')}
           </div>
           <div class="ocr-field-row">
-            ${ocrField('Precio retail (en la moneda elegida)', 'price_retail', 'number')}
+            ${ocrField('Precio por ticket (gastos de gestión incluidos)', 'price_retail', 'number')}
             ${ocrField('N tickets', 'n_tickets', 'number')}
             ${ocrField('Cuenta del retailer', 'cuenta', 'text')}
           </div>
