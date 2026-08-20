@@ -535,7 +535,12 @@ Reglas:
 - Formato numerico: punto como decimal y sin separador de miles. "1.234,56" -> 1234.56,
   "89,50" -> 89.5, "$1,250.00" -> 1250.
 - "price_retail_per_ticket" es el precio de UN ticket; "price_total" el del pedido entero.
-  Si solo se ve el total, deja per_ticket en null (el panel divide entre n_tickets).`;
+  Si solo se ve el total, deja per_ticket en null (el panel divide entre n_tickets).
+- FECHAS CON AÑO DE 2 CIFRAS: "29/9/26" es 2026, NUNCA 2024 ni 2029. Un "YY" suelto
+  siempre es 20YY. Formato de la mayoria de recibos europeos: DD/MM/AA o DD/MM/AAAA.
+- COHERENCIA DE FECHAS: estas entradas estan compradas para un evento que TODAVIA no ha
+  ocurrido. Si "event_date" te sale anterior a hoy, has leido mal el año: corrigelo.
+  "bought_date" nunca puede ser posterior a "event_date".`;
 
 async function ocrTicketImage(imageBase64, mediaType) {
   const client = getAnthropic();
@@ -547,7 +552,7 @@ async function ocrTicketImage(imageBase64, mediaType) {
       role: 'user',
       content: [
         { type: 'image', source: { type: 'base64', media_type: mediaType, data: imageBase64 } },
-        { type: 'text', text: OCR_PROMPT }
+        { type: 'text', text: OCR_PROMPT + '\n\nHoy es ' + today() + '. Usalo para resolver años de 2 cifras y para el campo bought_date.' }
       ]
     }]
   });
@@ -2617,6 +2622,31 @@ async function processOcrFile(file) {
       el.textContent = v + '%';
       el.className = 'conf ' + (v >= 85 ? 'conf-hi' : v >= 60 ? 'conf-md' : 'conf-lo');
     }
+    // AVISO DE FECHA PASADA: el panel marca 'lost' automaticamente todo evento ya
+    // celebrado, asi que una fecha mal leida (29/9/26 -> 2024) hace que el ticket se
+    // cree y desaparezca del Stock en el mismo instante. Aviso antes de guardar.
+    const inpFecha = document.querySelector('#ocr-form [name="event_date"]');
+    let avisoFecha = document.getElementById('ocr-aviso-fecha');
+    if (!avisoFecha) {
+      avisoFecha = document.createElement('div');
+      avisoFecha.id = 'ocr-aviso-fecha';
+      avisoFecha.style.cssText = 'margin:8px 0;padding:8px 12px;border-radius:8px;font-size:13px;display:none';
+      const cont = document.getElementById('ocr-form');
+      if (cont) cont.insertBefore(avisoFecha, cont.firstChild);
+    }
+    const revisarFecha = () => {
+      const v = inpFecha ? inpFecha.value : '';
+      if (v && v < new Date().toISOString().slice(0,10)) {
+        avisoFecha.style.display = '';
+        avisoFecha.style.background = 'rgba(239,68,68,.15)';
+        avisoFecha.style.color = '#f87171';
+        avisoFecha.innerHTML = String.fromCharCode(9888) + ' La fecha del evento (<strong>' + v + '</strong>) ya ha pasado. Si la guardas asi, el ticket entrara como <strong>perdido</strong> y no lo veras en Stock. Revisa el año.';
+      } else {
+        avisoFecha.style.display = 'none';
+      }
+    };
+    if (inpFecha) inpFecha.addEventListener('change', revisarFecha);
+    revisarFecha();
     // AVISO DE MONEDA: la IA detecta la moneda del ticket (currency_detected) pero el
     // campo de precio es en DOLARES, y ese dato se estaba tirando. Un ticket de 120 EUR
     // se guardaba como 120 USD y el beneficio salia inflado ~15% sin que nadie lo notara.
