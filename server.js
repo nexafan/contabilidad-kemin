@@ -504,8 +504,8 @@ Devuelve EXCLUSIVAMENTE un JSON válido con esta forma (sin markdown, sin texto 
   "fila": "...",
   "asiento": "...",
   "n_tickets": <int>,
-  "price_retail_per_ticket_usd": <float or null>,
-  "price_total_usd": <float or null>,
+  "price_retail_per_ticket": <float or null>,
+  "price_total": <float or null>,
   "currency_detected": "USD|EUR|GBP|...",
   "confidence": {
     "evento": 0-100,
@@ -527,7 +527,15 @@ Reglas:
 - Si es del marketplace (venta), enfócate en sold_at, payout y selling_platform.
 - Si hay varios tickets en el mismo precio, devuelve "n_tickets" > 1 (se crearán filas separadas en el panel).
 - Para asientos múltiples, devuelve un rango "14-15" o lista "14, 15".
-- Si no puedes leer un campo, ponlo a null y baja su confidence.`;
+- Si no puedes leer un campo, ponlo a null y baja su confidence.
+- PRECIOS: devuelve el importe TAL CUAL aparece en la captura, en la moneda del propio
+  ticket, y pon esa moneda en "currency_detected". NO conviertas a dolares: de eso se
+  encarga el panel. Un ticket de "EUR 89,50" es price_retail_per_ticket: 89.5 con
+  currency_detected: "EUR".
+- Formato numerico: punto como decimal y sin separador de miles. "1.234,56" -> 1234.56,
+  "89,50" -> 89.5, "$1,250.00" -> 1250.
+- "price_retail_per_ticket" es el precio de UN ticket; "price_total" el del pedido entero.
+  Si solo se ve el total, deja per_ticket en null (el panel divide entre n_tickets).`;
 
 async function ocrTicketImage(imageBase64, mediaType) {
   const client = getAnthropic();
@@ -2588,7 +2596,15 @@ async function processOcrFile(file) {
     setVal('seccion', fields.seccion);
     setVal('fila', fields.fila);
     setVal('asiento', fields.asiento);
-    setVal('price_retail', fields.price_retail_per_ticket_usd || fields.price_total_usd);
+    // Precio unitario. Ojo: si la IA solo ve el total del pedido hay que dividirlo entre
+    // los tickets — antes se metia el total tal cual como precio de UN ticket y el
+    // capital invertido salia multiplicado por n_tickets.
+    const nTk = Number(fields.n_tickets) > 0 ? Number(fields.n_tickets) : 1;
+    const perTicket = fields.price_retail_per_ticket ?? fields.price_retail_per_ticket_usd;
+    const totalPedido = fields.price_total ?? fields.price_total_usd;
+    let precioUnit = perTicket;
+    if (precioUnit == null && totalPedido != null) precioUnit = Math.round((Number(totalPedido) / nTk) * 100) / 100;
+    setVal('price_retail', precioUnit);
     setVal('n_tickets', fields.n_tickets || 1);
     setVal('cuenta', fields.cuenta);
     setVal('selling_platform', fields.selling_platform);
