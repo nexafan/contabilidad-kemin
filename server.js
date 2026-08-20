@@ -813,6 +813,15 @@ function buildStockRow(input, isUpdate = false) {
     updated_at: now
   };
   partial.status = computeStatus(partial);
+  // El 'lost' automatico por fecha de evento ya pasada NO se congela en la tabla: se
+  // deriva al leer (applyStatusAuto). Si se guardaba aqui, un año mal leido por el OCR
+  // (29/9/26 -> 2024) dejaba el ticket 'lost' PARA SIEMPRE, porque computeStatus corta
+  // en seco ante un status 'lost' guardado y corregir la fecha despues ya no lo devolvia
+  // al Stock. Un 'lost' puesto a mano, o por payout por debajo del retail, si se guarda.
+  if (partial.status === 'lost' && input.status !== 'lost'
+      && partial.payout_amount == null && partial.sold_at == null) {
+    partial.status = 'comprado';
+  }
   return partial;
 }
 function numOrNull(v) {
