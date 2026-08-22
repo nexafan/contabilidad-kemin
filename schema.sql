@@ -33,7 +33,21 @@ CREATE TABLE IF NOT EXISTS stock (
   ocr_log_id      TEXT,                                -- si vino de OCR
   notas           TEXT,
   created_at      TEXT NOT NULL,
-  updated_at      TEXT NOT NULL
+  updated_at      TEXT NOT NULL,
+
+  -- MONEDA. listed_at / sold_at SIEMPRE están en USD: son los que lee toda la
+  -- contabilidad del panel y no cambian nunca de unidad. Estas seis columnas
+  -- guardan de dónde salió ese dólar cuando el precio se tecleó en otra moneda:
+  -- el importe tal cual se escribió (300), en qué moneda (EUR) y con qué cambio
+  -- se convirtió (1.0842). Así el número es auditable meses después, cuando el
+  -- cambio del día ya no se recuerda. Si el precio se puso en dólares:
+  -- currency='USD', amount_orig = el mismo importe y fx = 1.
+  listed_currency    TEXT,
+  listed_amount_orig REAL,
+  listed_fx          REAL,
+  sold_currency      TEXT,
+  sold_amount_orig   REAL,
+  sold_fx            REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_stock_status    ON stock(status);

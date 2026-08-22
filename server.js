@@ -35,6 +35,25 @@ const SELLING_PLATFORMS = ['StubHub', 'Ticombo', 'AXS Resale', 'Viagogo', 'Vivid
 const TICKET_TYPES = ['MOBILE TRANSFER', 'PDF', 'HARD COPY', 'OTHER'];
 const STATUSES = ['comprado', 'listed', 'sold', 'cobrado', 'lost'];
 const EXPENSE_CATEGORIES = ['Proxy', 'Bot', 'Suscripción', 'Servidor', 'Bot operator', 'Otro'];
+// Monedas en las que se puede teclear un precio. La contabilidad SIGUE siendo en
+// USD: lo que se guarda en listed_at / sold_at siempre son dólares (ver schema.sql).
+// La lista cubre los países de los retailers con los que se opera; el símbolo es
+// solo para pintarlo al lado del importe.
+const CURRENCIES = [
+  { code: 'USD', symbol: '$',   label: 'Dólar (USD)' },
+  { code: 'EUR', symbol: '€',   label: 'Euro (EUR)' },
+  { code: 'GBP', symbol: '£',   label: 'Libra (GBP)' },
+  { code: 'CHF', symbol: 'CHF', label: 'Franco suizo (CHF)' },
+  { code: 'CAD', symbol: 'C$',  label: 'Dólar canadiense (CAD)' },
+  { code: 'AUD', symbol: 'A$',  label: 'Dólar australiano (AUD)' },
+  { code: 'MXN', symbol: 'MX$', label: 'Peso mexicano (MXN)' },
+  { code: 'SEK', symbol: 'kr',  label: 'Corona sueca (SEK)' },
+  { code: 'NOK', symbol: 'kr',  label: 'Corona noruega (NOK)' },
+  { code: 'DKK', symbol: 'kr',  label: 'Corona danesa (DKK)' },
+  { code: 'PLN', symbol: 'zł',  label: 'Zloty (PLN)' },
+  { code: 'CZK', symbol: 'Kč',  label: 'Corona checa (CZK)' }
+];
+const CURRENCY_CODES = CURRENCIES.map(c => c.code);
 
 // -----------------------------------------------------------------------------
 // Puerta de entrada: enlace secreto, sin usuario ni contraseña.
@@ -96,6 +115,23 @@ function ensureColumn(table, col, defn) {
   }
 }
 ensureColumn('capital_movements', 'runner_tag', 'TEXT');
+// Moneda del precio publicado y del precio de venta. Ver el comentario largo en
+// schema.sql: listed_at / sold_at siguen siendo USD, esto solo guarda el rastro
+// de cómo se llegó a ese dólar.
+for (const p of ['listed', 'sold']) {
+  ensureColumn('stock', p + '_currency', 'TEXT');
+  ensureColumn('stock', p + '_amount_orig', 'REAL');
+  ensureColumn('stock', p + '_fx', 'REAL');
+  // Los tickets que ya estaban apuntados son todos en dólares (antes no había
+  // otra opción). Se les pone la moneda explícita para que no queden a medias:
+  // una fila con importe pero sin moneda se quedaría con el hueco en blanco al
+  // abrirla para editar, y al guardar se habría borrado el importe.
+  const r = db.prepare(
+    `UPDATE stock SET ${p}_currency = 'USD', ${p}_amount_orig = ${p}_at, ${p}_fx = 1
+     WHERE ${p}_at IS NOT NULL AND ${p}_currency IS NULL`
+  ).run();
+  if (r.changes) console.log(`Migración: ${r.changes} fila(s) marcadas como ${p} en USD`);
+}
 
 // -----------------------------------------------------------------------------
 // Anthropic client (lazy)
@@ -179,11 +215,15 @@ const Q = {
     INSERT INTO stock (id, evento, bought_date, event_date, retailer, cuenta, selling_platform,
                        ticket_type, seccion, fila, asiento, price_retail, listed_at, sold_at,
                        payout_amount, status, sold_date, payout_date, fulfilled, origin,
-                       ocr_log_id, notas, created_at, updated_at)
+                       ocr_log_id, notas, created_at, updated_at,
+                       listed_currency, listed_amount_orig, listed_fx,
+                       sold_currency, sold_amount_orig, sold_fx)
     VALUES (@id, @evento, @bought_date, @event_date, @retailer, @cuenta, @selling_platform,
             @ticket_type, @seccion, @fila, @asiento, @price_retail, @listed_at, @sold_at,
             @payout_amount, @status, @sold_date, @payout_date, @fulfilled, @origin,
-            @ocr_log_id, @notas, @created_at, @updated_at)
+            @ocr_log_id, @notas, @created_at, @updated_at,
+            @listed_currency, @listed_amount_orig, @listed_fx,
+            @sold_currency, @sold_amount_orig, @sold_fx)
   `),
   updateStock: db.prepare(`
     UPDATE stock SET
@@ -192,7 +232,9 @@ const Q = {
       seccion=@seccion, fila=@fila, asiento=@asiento, price_retail=@price_retail,
       listed_at=@listed_at, sold_at=@sold_at, payout_amount=@payout_amount, status=@status,
       sold_date=@sold_date, payout_date=@payout_date, fulfilled=@fulfilled, origin=@origin,
-      notas=@notas, updated_at=@updated_at
+      notas=@notas, updated_at=@updated_at,
+      listed_currency=@listed_currency, listed_amount_orig=@listed_amount_orig, listed_fx=@listed_fx,
+      sold_currency=@sold_currency, sold_amount_orig=@sold_amount_orig, sold_fx=@sold_fx
     WHERE id=@id
   `),
   deleteStock: db.prepare(`DELETE FROM stock WHERE id = ?`),
@@ -686,30 +728,63 @@ app.get('/manifest.json', (req, res) => {
 // =============================================================================
 // API — FX (tipo de cambio para anotar tickets en EUR/GBP y guardarlos en USD)
 // =============================================================================
-// El panel guarda TODO en USD. Cuando la captura viene en otra moneda, el cliente
-// pide aquí la tasa del día y convierte antes de crear las filas. Fuente:
-// frankfurter.app (BCE, sin API key). Cache de 12h para no depender de la red.
-const fxCache = {}; // { EUR: { rate, ts } }
-app.get('/api/fx/:from', async (req, res) => {
-  const from = String(req.params.from || '').toUpperCase();
-  if (!/^[A-Z]{3}$/.test(from)) return res.status(400).json({ error: 'moneda inválida' });
-  if (from === 'USD') return res.json({ rate: 1, from, to: 'USD' });
-  const hit = fxCache[from];
-  if (hit && Date.now() - hit.ts < 12 * 3600 * 1000) return res.json({ rate: hit.rate, from, to: 'USD', cached: true });
+// El panel guarda TODO en USD. Cuando el precio se teclea en otra moneda, se pide
+// aquí el cambio y se convierte antes de guardar.
+//
+// Se llama desde el SERVIDOR y no desde el navegador: así funciona igual desde el
+// móvil, se cachea una sola vez para todos, y el panel no depende de que el
+// navegador pueda salir a ese dominio.
+//
+// Fuente: frankfurter.app (tipos de referencia del Banco Central Europeo, sin
+// clave ni registro). Si no contesta se responde con un error claro y el panel
+// deja escribir el cambio a mano — nunca se inventa un 1.0 por defecto, que sería
+// contar euros como dólares.
+const fxCache = new Map();               // clave: "EUR|latest" o "EUR|2026-08-20"
+const FX_TTL_MS = 12 * 60 * 60 * 1000;   // el BCE publica una vez al día
+
+async function getFxRate(from, fecha) {
+  if (from === 'USD') return { rate: 1, from, to: 'USD', date: today(), source: 'fijo' };
+  const key = from + '|' + (fecha || 'latest');
+  const hit = fxCache.get(key);
+  // El cambio de una fecha pasada ya no se mueve: ese se guarda para siempre.
+  if (hit && (hit.fechaFija || Date.now() - hit.ts < FX_TTL_MS)) return { ...hit.data, cached: true };
   try {
-    const r = await fetch(`https://api.frankfurter.app/latest?from=${from}&to=USD`);
+    const r = await fetch(`https://api.frankfurter.app/${fecha || 'latest'}?from=${from}&to=USD`,
+      { signal: AbortSignal.timeout(8000) });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const j = await r.json();
     const rate = Number(j?.rates?.USD);
-    if (!rate || isNaN(rate)) throw new Error('respuesta sin tasa');
-    fxCache[from] = { rate, ts: Date.now() };
-    res.json({ rate, from, to: 'USD' });
+    if (!(rate > 0)) throw new Error('respuesta sin tipo de cambio');
+    // Ojo: el BCE no publica fines de semana ni festivos, así que la fecha que
+    // devuelve puede ser anterior a la pedida. Se guarda tal cual y se enseña.
+    const data = { rate, from, to: 'USD', date: j.date || fecha || today(), source: 'BCE (frankfurter.app)' };
+    fxCache.set(key, { ts: Date.now(), data, fechaFija: !!fecha });
+    return data;
   } catch (e) {
-    // Si hay cache viejo, mejor eso que nada
-    if (hit) return res.json({ rate: hit.rate, from, to: 'USD', cached: true, stale: true });
-    res.status(502).json({ error: 'No pude obtener el tipo de cambio ' + from + '→USD: ' + e.message });
+    // Con un cambio guardado de antes se puede seguir trabajando; se avisa de que
+    // no es el de hoy para que quien apunta decida si le vale.
+    if (hit) return { ...hit.data, cached: true, stale: true, source: hit.data.source + ' — guardado de antes, sin conexión ahora' };
+    throw e;
   }
+}
+
+async function responderFx(from, fecha, res) {
+  if (!CURRENCY_CODES.includes(from)) return res.status(400).json({ error: 'Moneda no soportada: ' + from });
+  try {
+    res.json(await getFxRate(from, fecha));
+  } catch (e) {
+    res.status(503).json({ error: 'No se ha podido consultar el cambio ' + from + '→USD: ' + e.message });
+  }
+}
+
+// Dos formas de pedirlo, misma respuesta: /api/fx?from=EUR (admite &date=YYYY-MM-DD
+// para operaciones de otro día) y /api/fx/EUR, que es la que usa el lector de capturas.
+app.get('/api/fx', (req, res) => {
+  const fecha = ISO_DATE_RE.test(String(req.query.date || '')) ? req.query.date : null;
+  return responderFx(String(req.query.from || '').toUpperCase().trim(), fecha, res);
 });
+app.get('/api/fx/:from', (req, res) =>
+  responderFx(String(req.params.from || '').toUpperCase().trim(), null, res));
 
 // =============================================================================
 // API — STOCK
@@ -756,7 +831,7 @@ app.patch('/api/stock/:id', (req, res) => {
   const existing = Q.getStockById.get(req.params.id);
   if (!existing) return res.status(404).json({ error: 'not found' });
   try {
-    const merged = { ...existing, ...req.body, id: existing.id };
+    const merged = mergeStockPatch(existing, req.body);
     const row = buildStockRow(merged, /*isUpdate*/ true);
     Q.updateStock.run(row);
     res.json({ ok: true });
@@ -770,12 +845,134 @@ app.delete('/api/stock/:id', (req, res) => {
   res.json({ ok: r.changes > 0 });
 });
 
+// -----------------------------------------------------------------------------
+// Acciones sobre VARIOS tickets a la vez (marcar publicado / vendido / borrar).
+// Van en una transacción: o entran los 8 tickets del lote, o no entra ninguno.
+// A medias es peor que nada — dejaría media compra apuntada como vendida y la
+// otra media en stock, y cuadrar eso a mano después es un infierno.
+// -----------------------------------------------------------------------------
+const MAX_BULK = 500;
+function readIds(req) {
+  const ids = Array.isArray(req.body.ids) ? req.body.ids.filter(x => typeof x === 'string' && x) : [];
+  if (!ids.length) throw new Error('No has seleccionado ningún ticket.');
+  if (ids.length > MAX_BULK) throw new Error(`Demasiados tickets de golpe (máximo ${MAX_BULK}).`);
+  return [...new Set(ids)];
+}
+
+app.post('/api/stock/bulk-update', (req, res) => {
+  try {
+    const ids = readIds(req);
+    const patch = (req.body.patch && typeof req.body.patch === 'object') ? req.body.patch : null;
+    if (!patch) throw new Error('Falta qué cambiar.');
+    delete patch.id;   // el id de cada fila manda, no el que venga en el cuerpo
+
+    const tx = db.transaction((lista) => {
+      const faltan = [];
+      for (const id of lista) {
+        const existing = Q.getStockById.get(id);
+        if (!existing) { faltan.push(id); continue; }
+        Q.updateStock.run(buildStockRow(mergeStockPatch(existing, patch), /*isUpdate*/ true));
+      }
+      if (faltan.length) throw new Error(`${faltan.length} ticket(s) ya no existen. No se ha tocado nada.`);
+      return lista.length;
+    });
+    res.json({ ok: true, updated: tx(ids) });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.post('/api/stock/bulk-delete', (req, res) => {
+  try {
+    const ids = readIds(req);
+    const tx = db.transaction((lista) => {
+      let n = 0;
+      for (const id of lista) n += Q.deleteStock.run(id).changes;
+      return n;
+    });
+    res.json({ ok: true, deleted: tx(ids) });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// (El cambio de moneda se sirve más arriba, en la sección FX: /api/fx y /api/fx/:from)
+
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 function validDateOrNull(v) {
   if (!v) return null;
   if (!ISO_DATE_RE.test(v)) throw new Error('Fecha inválida (formato YYYY-MM-DD): ' + v);
   return v;
 }
+function round2(n) {
+  if (n === null || n === undefined || isNaN(n)) return null;
+  return Math.round(n * 100) / 100;
+}
+
+// -----------------------------------------------------------------------------
+// MONEDA. Normaliza uno de los dos tramos con precio (listed / sold).
+//
+// La regla de oro del panel: listed_at y sold_at son DÓLARES, siempre. Todo lo
+// que calcula dinero (tesorería, profit, comisiones de runners) lee esos dos
+// campos y no sabe nada de monedas. Aquí es donde se traduce, una sola vez, y
+// se deja anotado el rastro: cuánto se tecleó, en qué moneda y con qué cambio.
+//
+// Es a propósito que esto REVIENTE si llega una moneda extranjera sin cambio:
+// el fallo silencioso sería guardar 300 EUR como 300 USD e inflar el beneficio
+// de ese ticket un 8% sin que nadie lo vea. Antes un error en pantalla.
+// -----------------------------------------------------------------------------
+function resolveMoney(prefix, input) {
+  const at = prefix + '_at', cur = prefix + '_currency';
+  const orig = prefix + '_amount_orig', fxK = prefix + '_fx';
+  const vacio = { [at]: null, [cur]: null, [orig]: null, [fxK]: null };
+
+  const code = String(input[cur] || '').toUpperCase().trim();
+  const nOrig = numOrNull(input[orig]);
+  const nFx = numOrNull(input[fxK]);
+  const nAt = numOrNull(input[at]);
+
+  // Este tramo no tiene importe: ni publicado ni vendido todavía.
+  if (nOrig === null && nAt === null) return vacio;
+
+  // Sin moneda declarada o en dólares: el importe ya viene en USD.
+  if (!code || code === 'USD') {
+    const usd = round2(nOrig !== null ? nOrig : nAt);
+    return { [at]: usd, [cur]: 'USD', [orig]: usd, [fxK]: 1 };
+  }
+
+  if (!CURRENCY_CODES.includes(code)) throw new Error('Moneda no soportada: ' + code);
+  if (nFx === null || !(nFx > 0)) {
+    throw new Error(`Falta el cambio de ${code} a USD para convertir el importe.`);
+  }
+  const importe = nOrig !== null ? nOrig : nAt;
+  return { [at]: round2(importe * nFx), [cur]: code, [orig]: round2(importe), [fxK]: nFx };
+}
+
+// Compone la fila que se va a guardar a partir de la que ya existe y de los
+// campos que llegan en un PATCH. Sin esto, editar solo el importe en dólares de
+// un ticket que se había vendido en euros dejaba pegados la moneda y el cambio
+// viejos, y resolveMoney volvía a multiplicar por ellos: el importe tecleado se
+// perdía y salía otro número. Regla: quien toca la moneda manda sobre el tramo
+// entero; quien toca solo el importe está hablando en dólares.
+function mergeStockPatch(existing, patch) {
+  const merged = { ...existing, ...patch, id: existing.id };
+  for (const p of ['listed', 'sold']) {
+    const tocaMoneda = [p + '_currency', p + '_amount_orig', p + '_fx'].some(k => k in patch);
+    const tocaImporte = (p + '_at') in patch;
+    if (tocaMoneda) {
+      merged[p + '_currency'] = patch[p + '_currency'] ?? null;
+      merged[p + '_amount_orig'] = patch[p + '_amount_orig'] ?? null;
+      merged[p + '_fx'] = patch[p + '_fx'] ?? null;
+      delete merged[p + '_at'];   // lo recalcula resolveMoney desde importe × cambio
+    } else if (tocaImporte) {
+      merged[p + '_currency'] = 'USD';
+      merged[p + '_amount_orig'] = numOrNull(patch[p + '_at']);
+      merged[p + '_fx'] = 1;
+    }
+  }
+  return merged;
+}
+
 function buildStockRow(input, isUpdate = false) {
   const evento = (input.evento || '').trim();
   if (!evento) throw new Error('evento requerido');
@@ -805,8 +1002,8 @@ function buildStockRow(input, isUpdate = false) {
     fila: input.fila || null,
     asiento: input.asiento || null,
     price_retail: numOrNull(input.price_retail),
-    listed_at: numOrNull(input.listed_at),
-    sold_at: numOrNull(input.sold_at),
+    ...resolveMoney('listed', input),
+    ...resolveMoney('sold', input),
     payout_amount: numOrNull(input.payout_amount),
     sold_date: validDateOrNull(input.sold_date),
     payout_date: validDateOrNull(input.payout_date),
@@ -1091,7 +1288,7 @@ app.get('/', (req, res) => {
   res.send(renderPage({
     treasury, stockAll, stockActive, expenses, eventTabs, runners,
     finalizados, finalizadosPeriod, dash,
-    constants: { RETAILERS, SELLING_PLATFORMS, TICKET_TYPES, EXPENSE_CATEGORIES, STATUSES }
+    constants: { RETAILERS, SELLING_PLATFORMS, TICKET_TYPES, EXPENSE_CATEGORIES, STATUSES, CURRENCIES }
   }));
 });
 
@@ -1205,11 +1402,12 @@ function renderPage(ctx) {
 
 ${renderOcrModal()}
 ${renderEditModal(constants)}
+${renderBulkModal(constants)}
 ${renderCapitalModal()}
 ${renderRunnerModal()}
 
 <script>
-window.KEMIN = ${jsonScript({ retailers: constants.RETAILERS, platforms: constants.SELLING_PLATFORMS, ticketTypes: constants.TICKET_TYPES, expenseCats: constants.EXPENSE_CATEGORIES, statuses: constants.STATUSES })};
+window.KEMIN = ${jsonScript({ retailers: constants.RETAILERS, platforms: constants.SELLING_PLATFORMS, ticketTypes: constants.TICKET_TYPES, expenseCats: constants.EXPENSE_CATEGORIES, statuses: constants.STATUSES, currencies: constants.CURRENCIES })};
 ${CLIENT_JS}
 </script>
 </body></html>`;
@@ -1324,10 +1522,24 @@ function renderStockPage(rowsHtml, count, constants) {
         <button class="btn" onclick="openEditModal('stock', null)">＋ Nuevo ticket</button>
       </div>
 
+      <!-- Barra de selección. Sale sola al marcar la primera casilla y se queda
+           pegada abajo, para que en el móvil se llegue a los botones sin tener
+           que subir hasta la cabecera de la tabla. -->
+      <div id="stock-bulk-bar" class="bulk-bar" hidden>
+        <div class="bulk-count"><strong id="bulk-n">0</strong> seleccionados</div>
+        <div class="bulk-actions">
+          <button class="btn btn-sm" onclick="openBulkModal('listed')">🏷 Marcar Listed</button>
+          <button class="btn btn-sm" onclick="openBulkModal('sold')">💵 Marcar Sold</button>
+          <button class="btn btn-sm btn-danger" onclick="bulkDelete()">🗑 Eliminar</button>
+          <button class="btn btn-sm btn-ghost" onclick="clearStockSelection()">Quitar selección</button>
+        </div>
+      </div>
+
       <div class="table-wrap">
         <table id="stock-table">
           <thead>
             <tr>
+              <th class="col-check"><input type="checkbox" id="stock-check-all" title="Seleccionar todos los visibles" /></th>
               <th>Evento</th>
               <th>Origen</th>
               <th>Bought</th>
@@ -1345,7 +1557,7 @@ function renderStockPage(rowsHtml, count, constants) {
               <th class="row-actions">⋯</th>
             </tr>
           </thead>
-          <tbody>${rowsHtml || `<tr><td colspan="15">${emptyStateInTable('Sin tickets aún', 'Click ＋ Nuevo ticket o 📸 Subir captura para empezar.', '🎟')}</td></tr>`}</tbody>
+          <tbody>${rowsHtml || `<tr><td colspan="16">${emptyStateInTable('Sin tickets aún', 'Click ＋ Nuevo ticket o 📸 Subir captura para empezar.', '🎟')}</td></tr>`}</tbody>
         </table>
       </div>
     </div>
@@ -1366,6 +1578,7 @@ function renderStockRow(r) {
     : `<span class="pill pill-violet" title="Runner: ${escAttr(origin)}">🏃 ${esc(origin)}</span>`;
   return `
   <tr data-id="${escAttr(r.id)}" data-status="${escAttr(r.status)}" data-evento="${escAttr(r.evento)}" data-retailer="${escAttr(r.retailer || '')}" data-origin="${escAttr(origin)}">
+    <td class="col-check"><input type="checkbox" class="stock-check" value="${escAttr(r.id)}" aria-label="Seleccionar ticket" /></td>
     <td><strong>${esc(r.evento)}</strong></td>
     <td>${originPill}</td>
     <td>${fmtDateShort(r.bought_date)}</td>
@@ -1375,13 +1588,23 @@ function renderStockRow(r) {
     <td>${r.selling_platform ? `<span class="pill pill-blue">${esc(r.selling_platform)}</span>` : '—'}</td>
     <td class="editable">${esc(seccion)}</td>
     <td class="num">${fmtUSD(r.price_retail)}</td>
-    <td class="num">${fmtUSD(r.listed_at)}</td>
-    <td class="num">${fmtUSD(r.sold_at)}</td>
+    <td class="num">${fmtUSD(r.listed_at)}${origBadge(r.listed_currency, r.listed_amount_orig)}</td>
+    <td class="num">${fmtUSD(r.sold_at)}${origBadge(r.sold_currency, r.sold_amount_orig)}</td>
     <td class="num">${fmtUSD(r.payout_amount, 2)}</td>
     <td class="num ${profitCls}">${profitStr}</td>
     <td>${statusPill}</td>
     <td><button class="row-menu" onclick="rowMenu(event, 'stock', '${escAttr(r.id)}')">⋯</button></td>
   </tr>`;
+}
+
+// Debajo del importe en dólares, en pequeño, lo que se tecleó de verdad. Solo
+// cuando no fue en dólares: si no, sería repetir el mismo número dos veces.
+function origBadge(currency, amount) {
+  if (!currency || currency === 'USD' || amount === null || amount === undefined) return '';
+  const c = CURRENCIES.find(x => x.code === currency);
+  const sym = c ? c.symbol : currency;
+  const txt = ['€', '£'].includes(sym) ? `${fmtNum(amount, 2)} ${sym}` : `${sym} ${fmtNum(amount, 2)}`;
+  return `<span class="fx-orig" title="Tecleado en ${esc(currency)} y convertido a dólares al guardar">${esc(txt)}</span>`;
 }
 
 function retailerTag(r) {
@@ -1821,7 +2044,7 @@ function renderOcrModal() {
           <div class="ocr-field-row">
             <div class="ocr-field"><label>Origen <span class="conf" style="background:rgba(139,92,246,0.15);color:var(--violet);">runner</span></label><select name="origin" id="ocr-origin"><option value="manual">Manual (compra propia)</option></select></div>
             ${ocrSelect('Selling platform', 'selling_platform', ['', ...SELLING_PLATFORMS])}
-            ${ocrSelect('Moneda del precio', 'currency', ['USD', 'EUR', 'GBP'])}
+            ${ocrSelect('Moneda del precio', 'currency', CURRENCY_CODES)}
           </div>
           ${ocrField('Notas', 'notas', 'text')}
         </form>
@@ -1845,11 +2068,71 @@ function ocrSelect(label, name, options) {
   return `<div class="ocr-field"><label>${label} <span class="conf" id="conf-${name}">—</span></label><select name="${name}">${options.map(o => `<option value="${esc(o)}">${esc(o) || '—'}</option>`).join('')}</select></div>`;
 }
 
+// -----------------------------------------------------------------------------
+// Modal de "marcar varios de golpe". Sirve igual para uno solo (el menú ⋯ de
+// cada fila lo abre con ese único ticket), así que hay un solo sitio donde se
+// teclea un precio de venta y todos pasan por la misma conversión de moneda.
+// -----------------------------------------------------------------------------
+function renderBulkModal(constants) {
+  const curOpts = constants.CURRENCIES
+    .map(c => `<option value="${c.code}">${esc(c.label)}</option>`).join('');
+  return `
+<div class="modal-overlay" id="bulk-modal">
+  <div class="modal" style="max-width: 560px;">
+    <div class="modal-header">
+      <h2 id="bulk-modal-title">Marcar tickets</h2>
+      <button class="close" onclick="closeModal('bulk-modal')">✕</button>
+    </div>
+    <div class="modal-body" style="grid-template-columns: 1fr; padding: 24px 28px;">
+      <form id="bulk-form" onsubmit="return saveBulk(event)">
+        <p id="bulk-form-info" class="bulk-info"></p>
+
+        <div class="ocr-field-row" style="grid-template-columns: 1.3fr 1fr;">
+          <div class="ocr-field">
+            <label id="bulk-amount-label">Precio por ticket *</label>
+            <input type="number" step="0.01" min="0" name="amount" id="bulk-amount" required
+                   inputmode="decimal" placeholder="0.00" />
+          </div>
+          <div class="ocr-field">
+            <label>Moneda</label>
+            <select name="currency" id="bulk-currency">${curOpts}</select>
+          </div>
+        </div>
+
+        <div class="ocr-field-row" id="bulk-fx-row" style="display:none; grid-template-columns: 1fr 1.6fr;">
+          <div class="ocr-field">
+            <label id="bulk-fx-label">Cambio a USD</label>
+            <input type="number" step="0.000001" min="0" name="fx" id="bulk-fx" inputmode="decimal" />
+          </div>
+          <div class="ocr-field">
+            <label>&nbsp;</label>
+            <div id="bulk-fx-note" class="fx-note">…</div>
+          </div>
+        </div>
+
+        <div class="ocr-field" id="bulk-date-wrap" style="display:none;">
+          <label>Fecha de venta</label>
+          <input type="date" name="fecha" id="bulk-date" />
+        </div>
+
+        <div id="bulk-preview" class="bulk-preview">—</div>
+
+        <div style="display: flex; gap: 10px; justify-content: flex-end; margin-top: 22px;">
+          <button type="button" class="btn btn-ghost" onclick="closeModal('bulk-modal')">Cancelar</button>
+          <button type="submit" class="btn" id="bulk-submit">✓ Aplicar</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>`;
+}
+
 function renderEditModal(constants) {
   const retailerOpts = ['', ...constants.RETAILERS].map(r => `<option value="${r}">${r || '—'}</option>`).join('');
   const platformOpts = ['', ...constants.SELLING_PLATFORMS].map(p => `<option value="${esc(p)}">${esc(p) || '—'}</option>`).join('');
   const ticketTypeOpts = ['', ...constants.TICKET_TYPES].map(t => `<option value="${esc(t)}">${esc(t) || '—'}</option>`).join('');
   const expCatOpts = ['', ...constants.EXPENSE_CATEGORIES].map(c => `<option value="${esc(c)}">${esc(c) || '—'}</option>`).join('');
+  const curOpts = constants.CURRENCIES.map(c => `<option value="${c.code}">${esc(c.label)}</option>`).join('');
   return `
 <div class="modal-overlay" id="edit-modal">
   <div class="modal" style="max-width: 720px;">
@@ -1879,11 +2162,28 @@ function renderEditModal(constants) {
             <div class="ocr-field"><label>Fila</label><input type="text" name="fila" /></div>
             <div class="ocr-field"><label>Asiento</label><input type="text" name="asiento" /></div>
           </div>
-          <div class="ocr-field-row">
-            <div class="ocr-field"><label>Price retail (USD)</label><input type="number" step="0.01" name="price_retail" /></div>
-            <div class="ocr-field"><label>Listed at (USD)</label><input type="number" step="0.01" name="listed_at" /></div>
-            <div class="ocr-field"><label>Sold at (USD)</label><input type="number" step="0.01" name="sold_at" /></div>
+          <div class="ocr-field">
+            <label>Price retail (USD)</label><input type="number" step="0.01" name="price_retail" />
           </div>
+          <!-- Publicado y vendido se teclean en su moneda: el panel los pasa a
+               dólares al guardar. El campo en dólares no se escribe a mano, se
+               calcula, para que no puedan acabar diciendo cosas distintas. -->
+          ${['listed', 'sold'].map(p => `
+          <div class="ocr-field-row" style="grid-template-columns: 1.2fr 1fr 1fr;">
+            <div class="ocr-field">
+              <label>${p === 'listed' ? 'Listed at' : 'Sold at'}</label>
+              <input type="number" step="0.01" name="${p}_amount_orig" data-fx-amount="${p}" />
+            </div>
+            <div class="ocr-field">
+              <label>Moneda</label>
+              <select name="${p}_currency" data-fx-currency="${p}">${curOpts}</select>
+            </div>
+            <div class="ocr-field">
+              <label>Cambio a USD</label>
+              <input type="number" step="0.000001" name="${p}_fx" data-fx-rate="${p}" />
+            </div>
+          </div>
+          <div class="fx-note" data-fx-note="${p}" style="margin:-6px 0 12px;"></div>`).join('')}
           <div class="ocr-field-row">
             <div class="ocr-field"><label>Payout amount (USD)</label><input type="number" step="0.01" name="payout_amount" /></div>
             <div class="ocr-field"><label>Sold date</label><input type="date" name="sold_date" /></div>
@@ -2029,6 +2329,46 @@ header { display: flex; justify-content: space-between; align-items: flex-start;
 .btn-ghost { background: var(--surface); border: 1px solid var(--border); color: var(--text-dim); }
 .btn-ghost:hover { background: var(--surface-2); color: var(--text); box-shadow: none; }
 .btn-ocr { background: linear-gradient(135deg, #8b5cf6, #22d3ee); }
+.btn-sm { padding: 7px 13px; font-size: 12px; border-radius: 9px; }
+.btn-danger { background: linear-gradient(135deg, #b91c1c, #ef4444); color: #fff; }
+.btn-danger:hover { box-shadow: 0 6px 18px rgba(239,68,68,0.3); }
+/* --- Selección múltiple en Stock --- */
+th.col-check, td.col-check { width: 38px; padding-left: 14px; padding-right: 0; text-align: center; }
+.col-check input[type=checkbox] { width: 17px; height: 17px; accent-color: var(--cyan); cursor: pointer;
+  vertical-align: middle; }
+tbody tr.row-selected { background: rgba(34,211,238,0.09); }
+tbody tr.row-selected:hover { background: rgba(34,211,238,0.14); }
+/* Fija abajo, no sticky: el bloque que envuelve la tabla lleva overflow:hidden
+   para poder plegarse, y ahí dentro un sticky no llega a pegarse a nada. */
+/* Centrada con márgenes automáticos, NO con translateX: la animación de entrada
+   fija su propio transform al terminar y se comería el centrado, dejando la
+   barra pegada a la derecha. */
+.bulk-bar { position: fixed; left: 12px; right: 12px; margin: 0 auto; width: max-content; z-index: 60;
+  bottom: calc(18px + env(safe-area-inset-bottom, 0px)); max-width: calc(100vw - 24px);
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  padding: 12px 18px; border-radius: 14px;
+  background: linear-gradient(135deg, rgba(29,78,216,0.96), rgba(17,24,39,0.98));
+  border: 1px solid rgba(34,211,238,0.45); box-shadow: 0 10px 34px rgba(0,0,0,0.6);
+  backdrop-filter: blur(8px); animation: fadeUp 0.2s both; }
+.bulk-bar[hidden] { display: none; }
+/* Con la barra puesta, los avisos suben para no quedar tapados */
+body.has-bulk-bar #toast-container { bottom: 100px; }
+.bulk-count { font-size: 13px; color: var(--cyan-soft); white-space: nowrap; }
+.bulk-count strong { font-family: 'JetBrains Mono', monospace; font-size: 17px; color: #fff; margin-right: 4px; }
+.bulk-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-left: auto; }
+.bulk-info { font-size: 13px; color: var(--text-dim); margin-bottom: 16px; padding: 10px 14px;
+  background: var(--surface-2); border: 1px solid var(--border); border-left: 3px solid var(--cyan);
+  border-radius: 8px; }
+.bulk-preview { margin-top: 16px; padding: 12px 14px; border-radius: 10px; font-size: 13px;
+  background: rgba(16,185,129,0.08); border: 1px solid rgba(16,185,129,0.25); color: #6ee7b7;
+  font-family: 'JetBrains Mono', monospace; line-height: 1.7; }
+.bulk-preview.warn { background: rgba(245,158,11,0.10); border-color: rgba(245,158,11,0.3); color: var(--amber-soft); }
+.bulk-preview.bad { background: rgba(239,68,68,0.10); border-color: rgba(239,68,68,0.3); color: #fca5a5; }
+.fx-note { font-size: 11px; color: var(--text-mute); line-height: 1.5; padding-top: 9px; }
+.fx-note a { color: var(--cyan); cursor: pointer; text-decoration: underline; }
+/* Importe original bajo el dólar, cuando el precio se tecleó en otra moneda */
+.fx-orig { display: block; font-family: 'JetBrains Mono', monospace; font-size: 10px;
+  color: var(--amber-soft); opacity: 0.8; margin-top: 2px; letter-spacing: -0.2px; }
 .table-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; overflow: hidden; overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 thead { background: var(--bg-2); }
@@ -2291,6 +2631,16 @@ tr:hover .row-menu { color: var(--text-dim); }
   .modal-footer > div { display: flex; gap: 10px; }
   .modal-footer .btn { flex: 1; }
   .status-chip { font-size: 10px; padding: 4px 10px; }
+  /* La barra de selección ocupa el ancho y los botones se reparten en dos
+     filas: en el móvil hay que poder darles con el pulgar. */
+  .bulk-bar { left: 8px; right: 8px; width: auto; max-width: none; padding: 10px 12px; gap: 8px; }
+  .bulk-count { font-size: 12px; width: 100%; }
+  .bulk-actions { margin-left: 0; width: 100%; }
+  /* 12px arriba y abajo deja el botón en ~42px de alto: por debajo de eso se
+     falla al darle con el pulgar. */
+  .bulk-actions .btn { flex: 1 1 45%; justify-content: center; padding: 12px 8px; }
+  th.col-check, td.col-check { width: 30px; padding-left: 8px; }
+  .col-check input[type=checkbox] { width: 20px; height: 20px; }
 }
 @media (max-width: 420px) {
   .kpi-grid { grid-template-columns: 1fr; }
@@ -2314,7 +2664,12 @@ function activateTab(target, opts = {}) {
   return true;
 }
 document.querySelectorAll('.tab').forEach(tab => {
-  tab.addEventListener('click', () => activateTab(tab.dataset.tab));
+  tab.addEventListener('click', () => {
+    activateTab(tab.dataset.tab);
+    // La barra de selección de Stock vive fuera de las páginas: hay que decirle
+    // que se esconda cuando la pestaña que se ve no es la suya.
+    if (typeof refreshBulkBar === 'function') refreshBulkBar();
+  });
 });
 // Restaurar tab desde URL hash al cargar (sobrevive a location.reload)
 (function restoreTab() {
@@ -2437,6 +2792,232 @@ function applyStockFilters() {
     });
   }
 })();
+// =============================================================================
+// SELECCIÓN MÚLTIPLE EN STOCK
+// Marcar varias casillas y aplicarles lo mismo a todas: el caso de "he comprado
+// 8 entradas del mismo concierto y las he publicado todas al mismo precio".
+// =============================================================================
+// La barra se cuelga del body nada más cargar. Escrita donde está en el HTML se
+// queda dentro de la sección de la página, que arrastra un "transform" de la
+// animación de entrada: un elemento fijo dentro de algo con transform deja de
+// anclarse a la pantalla y se ancla a esa caja — la barra aparecía a mitad del
+// documento, fuera de la vista, en vez de pegada abajo.
+(function sacarBarraDelContenedorAnimado() {
+  const bar = document.getElementById('stock-bulk-bar');
+  if (bar && bar.parentElement !== document.body) document.body.appendChild(bar);
+})();
+function stockChecks() {
+  return Array.from(document.querySelectorAll('#stock-table .stock-check'));
+}
+window.selectedStockIds = function() {
+  return stockChecks().filter(c => c.checked).map(c => c.value);
+};
+function refreshBulkBar() {
+  const ids = selectedStockIds();
+  const bar = document.getElementById('stock-bulk-bar');
+  if (!bar) return;
+  // Solo se enseña estando en Stock: colgada del body se vería también desde
+  // Tesorería o Gastos, ofreciendo marcar tickets que ahí ni se ven.
+  const enStock = !!document.getElementById('page-stock')?.classList.contains('active');
+  const visible = ids.length > 0 && enStock;
+  bar.hidden = !visible;
+  document.body.classList.toggle('has-bulk-bar', visible);
+  const n = document.getElementById('bulk-n');
+  if (n) n.textContent = ids.length;
+  stockChecks().forEach(c => c.closest('tr').classList.toggle('row-selected', c.checked));
+  // La casilla de la cabecera refleja lo que hay marcado ENTRE LAS VISIBLES,
+  // no entre todas: si hay un filtro puesto, lo de fuera del filtro no cuenta.
+  const visibles = stockChecks().filter(c => c.closest('tr').style.display !== 'none');
+  const marcadas = visibles.filter(c => c.checked).length;
+  const all = document.getElementById('stock-check-all');
+  if (all) {
+    all.checked = visibles.length > 0 && marcadas === visibles.length;
+    all.indeterminate = marcadas > 0 && marcadas < visibles.length;
+  }
+}
+window.clearStockSelection = function() {
+  stockChecks().forEach(c => { c.checked = false; });
+  refreshBulkBar();
+};
+(function initStockSelection() {
+  let ultima = null;   // para el shift+click
+  document.getElementById('stock-table')?.addEventListener('click', (ev) => {
+    const chk = ev.target.closest('.stock-check');
+    if (!chk) return;
+    const todas = stockChecks();
+    const i = todas.indexOf(chk);
+    // Shift+click marca todo el tramo entre la anterior y esta, saltándose las
+    // filas escondidas por un filtro.
+    if (ev.shiftKey && ultima !== null && ultima !== i) {
+      const [a, b] = ultima < i ? [ultima, i] : [i, ultima];
+      for (let k = a; k <= b; k++) {
+        if (todas[k].closest('tr').style.display !== 'none') todas[k].checked = chk.checked;
+      }
+    }
+    ultima = i;
+    refreshBulkBar();
+  });
+  document.getElementById('stock-check-all')?.addEventListener('change', (ev) => {
+    stockChecks().forEach(c => {
+      if (c.closest('tr').style.display !== 'none') c.checked = ev.target.checked;
+    });
+    refreshBulkBar();
+  });
+})();
+// Al cambiar un filtro, lo que deja de verse se deselecciona. Si no, se aplicaría
+// un cambio a tickets que ya no están en pantalla — la peor sorpresa posible.
+function pruneSelectionAfterFilter() {
+  let tocado = false;
+  stockChecks().forEach(c => {
+    if (c.checked && c.closest('tr').style.display === 'none') { c.checked = false; tocado = true; }
+  });
+  refreshBulkBar();
+  if (tocado) toast('Se ha quitado la selección de los tickets que el filtro ha escondido', 'info', 3500);
+}
+['stock-search','stock-filter-evento','stock-filter-retailer','stock-filter-status','stock-filter-origin']
+  .forEach(id => document.getElementById(id)?.addEventListener('input', pruneSelectionAfterFilter));
+
+// --- Modal de marcar (vale para varios o para uno solo) ---
+const BULK_ACC = {
+  listed: { titulo: '🏷 Marcar como Listed', label: 'Precio publicado por ticket *', fecha: false,
+            verbo: 'publicado', boton: '✓ Marcar Listed' },
+  sold:   { titulo: '💵 Marcar como Sold',   label: 'Precio de venta por ticket *', fecha: true,
+            verbo: 'vendido',  boton: '✓ Marcar Sold' }
+};
+let bulkCtx = { accion: 'listed', ids: [] };
+
+window.openBulkModal = function(accion, ids) {
+  const lista = ids && ids.length ? ids : selectedStockIds();
+  if (!lista.length) { toast('No has seleccionado ningún ticket', 'error'); return; }
+  const cfg = BULK_ACC[accion];
+  bulkCtx = { accion: accion, ids: lista };
+
+  const form = document.getElementById('bulk-form');
+  form.reset();
+  document.getElementById('bulk-modal-title').textContent = cfg.titulo;
+  document.getElementById('bulk-amount-label').textContent = cfg.label;
+  document.getElementById('bulk-submit').textContent = cfg.boton;
+  document.getElementById('bulk-date-wrap').style.display = cfg.fecha ? '' : 'none';
+  document.getElementById('bulk-date').value = new Date().toISOString().slice(0,10);
+  document.getElementById('bulk-currency').value = 'USD';
+  document.getElementById('bulk-fx-row').style.display = 'none';
+  document.getElementById('bulk-fx').value = '';
+
+  const info = document.getElementById('bulk-form-info');
+  info.innerHTML = lista.length === 1
+    ? 'Se marca como <strong>' + cfg.verbo + '</strong> <strong style="color:var(--cyan)">1 ticket</strong>.'
+    : 'Se marcan como <strong>' + cfg.verbo + '</strong> <strong style="color:var(--cyan)">' + lista.length +
+      ' tickets</strong>, todos al mismo precio.';
+  refreshBulkPreview();
+  openModal('bulk-modal');
+  setTimeout(() => document.getElementById('bulk-amount').focus(), 80);
+};
+
+// Cambio del día. Lo trae el servidor; si no lo consigue, se escribe a mano —
+// el importe NO se guarda nunca sin un cambio, para no contar euros como dólares.
+async function loadFxRate(code) {
+  const fila = document.getElementById('bulk-fx-row');
+  const campo = document.getElementById('bulk-fx');
+  const nota = document.getElementById('bulk-fx-note');
+  if (code === 'USD') { fila.style.display = 'none'; campo.value = ''; refreshBulkPreview(); return; }
+  fila.style.display = '';
+  document.getElementById('bulk-fx-label').textContent = '1 ' + code + ' = ? USD';
+  campo.value = '';
+  nota.textContent = 'Buscando el cambio de hoy…';
+  refreshBulkPreview();
+  try {
+    const r = await fetch('/api/fx?from=' + encodeURIComponent(code));
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || 'sin respuesta');
+    campo.value = j.rate;
+    nota.innerHTML = 'Cambio del ' + j.date + ' · ' + j.source +
+      '<br>Puedes cambiarlo si usaste otro.';
+  } catch (e) {
+    nota.innerHTML = '<span style="color:var(--amber-soft)">No se ha podido consultar el cambio.</span>' +
+      '<br>Escríbelo a mano (mira el cambio ' + code + '→USD del día de la operación).';
+  }
+  refreshBulkPreview();
+}
+document.getElementById('bulk-currency')?.addEventListener('change', e => loadFxRate(e.target.value));
+['bulk-amount','bulk-fx'].forEach(id =>
+  document.getElementById(id)?.addEventListener('input', refreshBulkPreview));
+
+function fmtMoney(n, dec) {
+  if (n === null || isNaN(n)) return '—';
+  return n.toLocaleString('en-US', { minimumFractionDigits: dec, maximumFractionDigits: dec });
+}
+function refreshBulkPreview() {
+  const box = document.getElementById('bulk-preview');
+  if (!box) return;
+  const n = bulkCtx.ids.length;
+  const amount = parseFloat(document.getElementById('bulk-amount').value);
+  const code = document.getElementById('bulk-currency').value;
+  const fx = parseFloat(document.getElementById('bulk-fx').value);
+  box.className = 'bulk-preview';
+
+  if (isNaN(amount) || amount < 0) { box.textContent = 'Escribe el precio para ver el total.'; box.classList.add('warn'); return; }
+  if (code !== 'USD' && !(fx > 0)) {
+    box.innerHTML = 'Falta el cambio de <strong>' + code + '</strong> a dólares. Sin él no se puede apuntar.';
+    box.classList.add('bad');
+    return;
+  }
+  const usd = code === 'USD' ? amount : Math.round(amount * fx * 100) / 100;
+  let html = '';
+  if (code !== 'USD') {
+    html += fmtMoney(amount, 2) + ' ' + code + ' × ' + fx + ' = <strong>$' + fmtMoney(usd, 2) + '</strong> por ticket<br>';
+  } else {
+    html += '<strong>$' + fmtMoney(usd, 2) + '</strong> por ticket<br>';
+  }
+  html += n + ' ticket' + (n > 1 ? 's' : '') + ' → total <strong>$' + fmtMoney(usd * n, 2) + '</strong>';
+  if (code !== 'USD') html += '<br><span style="opacity:.75">Se apunta en dólares. Se guarda también el importe en ' + code + '.</span>';
+  box.innerHTML = html;
+}
+
+window.saveBulk = async function(ev) {
+  ev.preventDefault();
+  const amount = parseFloat(document.getElementById('bulk-amount').value);
+  const code = document.getElementById('bulk-currency').value;
+  const fx = code === 'USD' ? 1 : parseFloat(document.getElementById('bulk-fx').value);
+  if (isNaN(amount) || amount < 0) { toast('Importe no válido', 'error'); return false; }
+  if (!(fx > 0)) { toast('Falta el cambio de ' + code + ' a dólares', 'error'); return false; }
+
+  const p = bulkCtx.accion === 'listed' ? 'listed' : 'sold';
+  const patch = {};
+  patch[p + '_amount_orig'] = amount;
+  patch[p + '_currency'] = code;
+  patch[p + '_fx'] = fx;
+  if (bulkCtx.accion === 'sold') patch.sold_date = document.getElementById('bulk-date').value || null;
+
+  const btn = document.getElementById('bulk-submit');
+  await submitWithButton(btn, async () => {
+    const r = await fetch('/api/stock/bulk-update', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ ids: bulkCtx.ids, patch: patch })
+    });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok) {
+      queueToast(j.updated + ' ticket' + (j.updated > 1 ? 's' : '') + ' actualizado' + (j.updated > 1 ? 's' : ''), 'success');
+      closeModal('bulk-modal');
+      softReload();
+    } else toast('Error: ' + (j.error || 'no se ha podido guardar'), 'error');
+  });
+  return false;
+};
+
+window.bulkDelete = async function() {
+  const ids = selectedStockIds();
+  if (!ids.length) { toast('No has seleccionado ningún ticket', 'error'); return; }
+  if (!confirm('¿Eliminar ' + ids.length + ' ticket' + (ids.length > 1 ? 's' : '') + ' definitivamente?\\n\\nNo se puede deshacer.')) return;
+  const r = await fetch('/api/stock/bulk-delete', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ ids: ids })
+  });
+  const j = await r.json().catch(() => ({}));
+  if (r.ok) { queueToast(j.deleted + ' ticket' + (j.deleted > 1 ? 's' : '') + ' eliminado' + (j.deleted > 1 ? 's' : ''), 'success'); softReload(); }
+  else toast('Error: ' + (j.error || 'no se ha podido eliminar'), 'error');
+};
+refreshBulkBar();
+
 // Saltar a Stock con filtro de origen pre-aplicado
 window.gotoStockFiltered = function(originTag) {
   document.querySelector('.tab[data-tab="stock"]').click();
@@ -2465,8 +3046,10 @@ window.rowMenu = function(e, kind, id) {
     { label: '✏ Editar', fn: () => kind === 'runner' ? openRunnerModal(id) : openEditModal(kind, id) },
     ...(kind !== 'runner' ? [{ label: '📋 Duplicar', fn: () => duplicateRow(kind, id) }] : []),
     ...(kind === 'stock' ? [
-      { label: '🏷 Marcar Listed', fn: () => quickPatch(kind, id, { status: 'listed', listed_at: prompt('Listed at (USD)?') }) },
-      { label: '💵 Marcar Sold', fn: () => quickPatch(kind, id, { status: 'sold', sold_at: prompt('Sold at (USD)?'), sold_date: new Date().toISOString().slice(0,10) }) },
+      // Abren el mismo modal que la selección múltiple, con este único ticket:
+      // así el precio y la moneda se piden igual se marque uno o veinte.
+      { label: '🏷 Marcar Listed', fn: () => openBulkModal('listed', [id]) },
+      { label: '💵 Marcar Sold', fn: () => openBulkModal('sold', [id]) },
       { label: '✅ Marcar Cobrado', fn: () => quickPatch(kind, id, { status: 'cobrado', payout_amount: prompt('Payout amount (USD)?'), payout_date: new Date().toISOString().slice(0,10) }) }
     ] : []),
     ...(kind === 'runner' ? [
@@ -2675,7 +3258,7 @@ async function processOcrFile(file) {
       if (contMoneda) contMoneda.insertBefore(avisoMoneda, contMoneda.firstChild);
     }
     const selMoneda = document.querySelector('#ocr-form [name="currency"]');
-    if (selMoneda) selMoneda.value = ['USD','EUR','GBP'].includes(moneda) ? moneda : 'USD';
+    if (selMoneda) selMoneda.value = (window.KEMIN.currencies || []).some(c => c.code === moneda) ? moneda : 'USD';
     if (moneda && moneda !== 'USD') {
       avisoMoneda.style.display = '';
       avisoMoneda.style.background = 'rgba(240,176,112,.15)';
@@ -2727,6 +3310,7 @@ window.confirmOcr = async function() {
 window.openEditModal = async function(kind, id, prefill = {}) {
   const form = document.getElementById('edit-form');
   form.reset();
+  form.querySelectorAll('[data-fx-note]').forEach(n => { n.textContent = ''; });
   form.elements['_kind'].value = kind;
   document.getElementById('edit-modal-title').textContent = id ? 'Editar ' + kind : 'Nuevo ' + kind;
   document.getElementById('edit-stock-fields').style.display = kind === 'stock' ? '' : 'none';
@@ -2747,8 +3331,66 @@ window.openEditModal = async function(kind, id, prefill = {}) {
     const el = form.elements[k];
     if (el) el.value = prefill[k];
   }
+  // Un ticket que aún no se ha publicado ni vendido no tiene moneda guardada, y
+  // el desplegable se quedaría en blanco: se deja en dólares, que es lo normal.
+  form.querySelectorAll('[data-fx-currency]').forEach(sel => {
+    if (!sel.value) sel.value = 'USD';
+    refreshEditFxNote(sel.dataset.fxCurrency);
+  });
   openModal('edit-modal');
 };
+// Debajo de cada precio, a cuánto sale en dólares: es el número que va a la
+// contabilidad, así que conviene verlo antes de guardar y no después.
+window.refreshEditFxNote = function(p) {
+  const form = document.getElementById('edit-form');
+  const nota = form.querySelector('[data-fx-note="' + p + '"]');
+  if (!nota || nota.dataset.busy === '1') return;
+  const imp = parseFloat(form.querySelector('[data-fx-amount="' + p + '"]').value);
+  const code = form.querySelector('[data-fx-currency="' + p + '"]').value;
+  const fx = parseFloat(form.querySelector('[data-fx-rate="' + p + '"]').value);
+  const fuente = nota.dataset.fuente ? ' · ' + nota.dataset.fuente : '';
+  if (isNaN(imp)) { nota.textContent = nota.dataset.fuente || ''; return; }
+  if (code === 'USD') { nota.textContent = 'Se apunta $' + fmtMoney(imp, 2) + '.'; return; }
+  if (!(fx > 0)) {
+    nota.innerHTML = '<span style="color:var(--amber-soft)">Falta el cambio de ' + code + ' a dólares.</span>';
+    return;
+  }
+  nota.textContent = 'Se apunta $' + fmtMoney(Math.round(imp * fx * 100) / 100, 2) + ' en dólares.' + fuente;
+};
+document.getElementById('edit-form')?.addEventListener('input', (ev) => {
+  const el = ev.target.closest('[data-fx-amount], [data-fx-rate]');
+  if (el) refreshEditFxNote(el.dataset.fxAmount || el.dataset.fxRate);
+});
+// En el modal de editar: al cambiar la moneda a mano se busca el cambio del día.
+// Solo al cambiarla a mano — abrir un ticket viejo NO le repisa el cambio con el
+// de hoy, que es lo que haría que el importe de una venta de hace tres meses se
+// moviera solo cada vez que alguien la abre para mirarla.
+document.getElementById('edit-form')?.addEventListener('change', async (ev) => {
+  const sel = ev.target.closest('[data-fx-currency]');
+  if (!sel) return;
+  const p = sel.dataset.fxCurrency;
+  const form = document.getElementById('edit-form');
+  const campo = form.querySelector('[data-fx-rate="' + p + '"]');
+  const nota = form.querySelector('[data-fx-note="' + p + '"]');
+  if (sel.value === 'USD') { campo.value = 1; nota.dataset.fuente = ''; refreshEditFxNote(p); return; }
+  nota.dataset.busy = '1';
+  nota.textContent = 'Buscando el cambio de hoy…';
+  try {
+    const r = await fetch('/api/fx?from=' + encodeURIComponent(sel.value));
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || 'sin respuesta');
+    campo.value = j.rate;
+    nota.dataset.fuente = 'Cambio del ' + j.date + ' · ' + j.source + '. Cámbialo si usaste otro.';
+    nota.dataset.busy = '';
+    refreshEditFxNote(p);
+  } catch (e) {
+    campo.value = '';
+    nota.dataset.fuente = '';
+    nota.dataset.busy = '';
+    nota.innerHTML = '<span style="color:var(--amber-soft)">No se ha podido consultar el cambio: escríbelo a mano.</span>';
+  }
+});
+
 window.toggleExpenseMode = function(val) {
   document.getElementById('exp-fijo-fields').style.display = val === 'fijo' ? '' : 'none';
   document.getElementById('exp-pct-fields').style.display = val === 'porcentaje' ? '' : 'none';

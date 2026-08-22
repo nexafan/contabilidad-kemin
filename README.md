@@ -10,6 +10,8 @@ Panel web para contabilidad y stock de tickets para reventa. Pensado para una LL
 
 - **Tesorería** — vista en vivo de dónde está cada dólar invertido (en stock sin listar, en stock listado, en vendidos sin payout, en cash recibido, en pérdidas).
 - **Stock** — todos los tickets activos con filtros, edición inline y subida de capturas con OCR automático.
+- **Marcar varios a la vez** — casilla por fila (y shift+click para un tramo entero): seleccionas los que fueron al mismo precio y los marcas Listed o Sold de golpe, o los borras. El lote es todo o nada.
+- **Precios en otra moneda** — el importe se teclea en euros, libras, francos… y el panel lo apunta en **dólares**, trayendo el cambio del día del BCE. Al lado queda anotado cuánto se tecleó y con qué cambio, para poder auditarlo meses después.
 - **Expenses** — gastos fijos + comisiones a operadores de bots externos (% sobre profit).
 - **Dashboard** — KPIs YTD + gráficos (margen mensual, profit por evento, por selling platform, tasa de venta).
 - **Finalizados** — operaciones cerradas filtrables por año / mes / semana / día.
@@ -217,6 +219,9 @@ Todos los endpoints piden la cookie `kemin_auth`, que se obtiene abriendo una ve
 | `POST` | `/api/stock/bulk` | Crear N tickets (usado por OCR) |
 | `PATCH`| `/api/stock/:id` | Editar ticket |
 | `DELETE`| `/api/stock/:id` | Eliminar |
+| `POST` | `/api/stock/bulk-update` | `{ids:[], patch:{}}` — aplica lo mismo a varios tickets, en una transacción |
+| `POST` | `/api/stock/bulk-delete` | `{ids:[]}` — borra varios de golpe |
+| `GET`  | `/api/fx?from=EUR` | Cambio de esa moneda a USD (BCE vía frankfurter.app, cacheado 6 h). `503` si no se puede consultar — nunca devuelve un cambio inventado |
 | `GET/POST/PATCH/DELETE` | `/api/expenses[/:id]` | CRUD gastos |
 | `GET`  | `/api/events` | Eventos (auto-creados al insertar stock) |
 | `PATCH`| `/api/events/:nombre` | Pin/hide tab dinámica |
@@ -247,6 +252,29 @@ profit_real = payout_amount - price_retail        # solo si cobrado
 profit_estimado = listed_at - price_retail        # si listado
 ```
 
+### Monedas
+
+**`listed_at` y `sold_at` son SIEMPRE dólares.** Todo lo que calcula dinero (tesorería,
+profit, comisiones de runners) lee esos dos campos y no sabe nada de monedas.
+
+Cuando un precio se teclea en otra moneda, la conversión se hace una sola vez, al
+guardar, y queda el rastro en tres columnas por tramo:
+
+| Columna | Qué guarda |
+|---|---|
+| `listed_at` / `sold_at` | el importe **en dólares** — lo que usa la contabilidad |
+| `listed_currency` / `sold_currency` | en qué moneda se tecleó (`USD` si fue en dólares) |
+| `listed_amount_orig` / `sold_amount_orig` | el importe tal cual se escribió (300) |
+| `listed_fx` / `sold_fx` | el cambio aplicado (1.0842); `1` si fue en dólares |
+
+Una moneda extranjera **sin cambio se rechaza con error**, a propósito: el fallo
+silencioso sería guardar 300 EUR como 300 USD e inflar el beneficio de ese ticket
+un 8% sin que nadie lo viera.
+
+El cambio lo trae el servidor de `frankfurter.app` (tipos de referencia del BCE,
+sin clave ni registro) y siempre se puede corregir a mano — que es lo que hay que
+hacer si la operación fue de otro día, o si no hay conexión.
+
 ### Bot operators (% sobre ganancia)
 
 Si un gasto se modela como `modo = 'porcentaje'` y se le asigna un `bot_origin_tag`, el panel calcula automáticamente:
@@ -257,6 +285,22 @@ total_pagado = base_profit × porcentaje
 ```
 
 Así puedes auditar exactamente qué tickets consiguió cada bot-op y cuánto le debes.
+
+---
+
+## Pruebas
+
+```bash
+node test/auth.test.mjs        # la puerta de entrada (enlace secreto + cookie)
+node test/stock-lote.test.mjs  # marcar varios a la vez + precios en otra moneda
+```
+
+Cada prueba arranca su propio server con una base de datos de usar y tirar, así que
+**no tocan datos reales**. Si el puerto que usan (4199 / 4196) está ocupado, avisan
+en vez de conectarse por error al panel que haya ahí.
+
+Desde Windows no se pueden correr (no hay `node_modules` compilados): se copian los
+ficheros a una carpeta temporal del VPS y se lanzan allí.
 
 ---
 
